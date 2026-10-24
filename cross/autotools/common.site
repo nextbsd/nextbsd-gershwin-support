@@ -1,0 +1,38 @@
+# Shared part of the autotools CONFIG_SITE files (amd64.site, arm64.site).
+#
+# Expects in the environment (exported by build-gershwin-support.sh):
+#   SYSROOT       the staged NextBSD base, with earlier components in /usr
+#   CROSS_BINDIR  the toolchain image's pinned clang/lld 19.1.7
+#   GS_CROSS      this directory's parent (cross/)
+# and gs_triple from the per-arch file that sources this one.
+
+: "${SYSROOT:?}" "${CROSS_BINDIR:?}" "${gs_triple:?}"
+
+# The cross compiler. -fuse-ld=lld goes in LDFLAGS (link only); clang finds
+# ld.lld beside itself.
+CC="$CROSS_BINDIR/clang --target=$gs_triple --sysroot=$SYSROOT"
+CXX="$CROSS_BINDIR/clang++ --target=$gs_triple --sysroot=$SYSROOT"
+CFLAGS="${CFLAGS:--O2 -pipe}"
+CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
+LDFLAGS="-fuse-ld=lld ${LDFLAGS:-}"
+AR="$CROSS_BINDIR/llvm-ar"
+RANLIB="$CROSS_BINDIR/llvm-ranlib"
+NM="$CROSS_BINDIR/llvm-nm"
+STRIP="$CROSS_BINDIR/llvm-strip"
+OBJCOPY="$CROSS_BINDIR/llvm-objcopy"
+
+# Programs that run on the build host during the build use the host compiler.
+CC_FOR_BUILD=cc
+
+# pkgconf (ISC), never freedesktop's GPL pkg-config. Only the sysroot's .pc
+# directories are searched, and -I/-L results are prefixed with the sysroot.
+PKG_CONFIG=pkgconf
+PKG_CONFIG_LIBDIR="$SYSROOT/usr/libdata/pkgconfig:$SYSROOT/usr/X11/lib/pkgconfig"
+PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
+export PKG_CONFIG_LIBDIR PKG_CONFIG_SYSROOT_DIR
+
+# Cache answers for checks that must run a target program, common to both
+# arches. Each needs a reason, e.g.:
+#   name_cv_check=value   # why this is the NextBSD answer
+# None are needed yet: wget's run-time checks fall back to gnulib's cross
+# guesses, which build and link cleanly on NextBSD.

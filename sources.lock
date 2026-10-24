@@ -1,0 +1,12 @@
+# Pinned upstream sources for nextbsd-gershwin-support.
+#
+# One line per component: <name> <version> <sha256> <url>
+# build-gershwin-support.sh downloads the URL (cached in .build/dl), refuses it unless the SHA-256
+# matches, unpacks it and applies patches/<name>/series in order. Bumping a
+# version is a deliberate change to this file (and to the component's notes in
+# README.md and NOTICE.md). Only upstream release tarballs: no FreeBSD
+# packages, ports or distfiles mirrors.
+#
+# name     version  sha256                                                            url
+wget       1.25.0   766e48423e79359ea31e41db9e5c289675947a7fcf2efdcedb726ac9d0da3784  https://ftp.gnu.org/gnu/wget/wget-1.25.0.tar.gz
+lcms2      2.19.1   bfc54f7bab59fbc921012014a8032e4cba4abd46db47d46b76416a8c0b2815c8  https://github.com/mm2/Little-CMS/releases/download/lcms2.19.1/lcms2-2.19.1.tar.gz

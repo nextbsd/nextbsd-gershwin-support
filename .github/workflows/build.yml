@@ -1,0 +1,116 @@
+name: Build NextBSD gershwin-support
+
+# Cross-builds what only Gershwin uses (wget, lcms2; later xdotool and the
+# squashfs tools) for amd64 and arm64 on the x86_64 runner, inside the per-arch
+# nextbsd-kernel-toolchain container, against compat's `continuous` base as the
+# sysroot, from the pinned tarballs in sources.lock.
+#
+# Every pull request builds both arches. Publishing (nextbsd-gershwin-support-
+# <arch>.tar.gz on the `continuous` release) happens only on a push to main or
+# a manual run on main, never from a pull request. Nothing is dispatched from
+# here: this repo builds by hand, in order, after the repos it depends on
+# (E24), and the package repository is built by hand too (nextbsd/nextbsd-pkg#16).
+# So there is no repository_dispatch trigger either.
+
+on:
+  push:
+    branches: [main]
+    paths: ['build-gershwin-support.sh', 'sources.lock', 'patches/**', 'cross/**', '.github/workflows/build.yml']
+  pull_request:
+    paths: ['build-gershwin-support.sh', 'sources.lock', 'patches/**', 'cross/**', '.github/workflows/build.yml']
+  workflow_dispatch:
+    inputs:
+      fbsd_sha:
+        description: 'Pinned FreeBSD SHA for the toolchain image tag (blank = latest)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    name: gershwin-support (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, target_arch: amd64 }
+          - { arch: arm64, target_arch: aarch64 }
+    container:
+      # Per-arch toolchain image: the pinned llvmorg-19.1.7 clang, lld and LLVM
+      # binutils at $CROSS_BINDIR (set by the image), plus meson, ninja, cmake,
+      # pkgconf and autotools (nextbsd-toolchain#13). Nothing is apt-installed
+      # here. Pinned to a FreeBSD SHA when the manual run carries one.
+      image: ghcr.io/nextbsd/nextbsd-kernel-toolchain:${{ matrix.arch }}-${{ inputs.fbsd_sha && format('fbsd-{0}', inputs.fbsd_sha) || 'latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Stage the cross sysroot from compat's `continuous` base: libc, OpenSSL,
+      # zlib and their headers and .pc files. build-gershwin-support.sh installs
+      # each component into this sysroot's /usr as it goes. A public read, so
+      # the built-in token is enough and fork PRs work.
+      - name: Stage sysroot from compat continuous
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/sysroot"
+          gh release download continuous \
+            --repo nextbsd/nextbsd-freebsd-compat \
+            --pattern "nextbsd-base-${{ matrix.arch }}.tar.gz" \
+            --output /tmp/base.tar.gz --clobber
+          tar -C "$GITHUB_WORKSPACE/sysroot" -xzf /tmp/base.tar.gz
+
+      # The pinned tarballs, keyed on sources.lock. The build re-checks every
+      # SHA-256 whether the file came from here or from upstream.
+      - name: Cache upstream tarballs
+        uses: actions/cache@v4
+        with:
+          path: .build/dl
+          key: sources-${{ hashFiles('sources.lock') }}
+          restore-keys: sources-
+
+      - name: Build into /stage
+        env:
+          T: ${{ matrix.arch }}
+          TA: ${{ matrix.target_arch }}
+          SYSROOT: ${{ github.workspace }}/sysroot
+          DESTDIR: /stage
+        run: |
+          chmod +x ./build-gershwin-support.sh
+          ./build-gershwin-support.sh
+
+      # Raw tar of /stage rooted at /, modes as staged.
+      - name: Pack artifact
+        run: |
+          tar -C /stage -czf "/tmp/nextbsd-gershwin-support-${{ matrix.arch }}.tar.gz" .
+          tar -tzvf "/tmp/nextbsd-gershwin-support-${{ matrix.arch }}.tar.gz" | grep -v '/$' || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nextbsd-gershwin-support-${{ matrix.arch }}
+          path: /tmp/nextbsd-gershwin-support-${{ matrix.arch }}.tar.gz
+
+  publish:
+    needs: build
+    # main only, and only from a push or a manual run: never a pull request.
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Gather artifacts
+        run: |
+          mkdir -p out
+          find artifacts -name 'nextbsd-gershwin-support-*.tar.gz' -exec cp {} out/ \;
+          ls -la out/
+      - name: Publish to continuous release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: continuous
+          name: Continuous gershwin-support build
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: out/*.tar.gz
+      # That is where this stops: no dispatch to nextbsd-pkg or any other repo.

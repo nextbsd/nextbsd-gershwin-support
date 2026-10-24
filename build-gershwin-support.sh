@@ -470,7 +470,7 @@ build_libfuse() {
         -Dutils=false -Dexamples=false -Dtests=false \
         -Denable-io-uring=false -Denable-usdt=false
     stage libfuse
-    local d="$DESTDIR$PREFIX" lib
+    local d="$DESTDIR$PREFIX" lib f
     for f in fuse.h fuse_common.h fuse_lowlevel.h fuse_opt.h; do
         test -f "$d/include/fuse3/$f" || fail "fuse3/$f not staged"
     done
@@ -481,7 +481,11 @@ build_libfuse() {
     needed_check "$lib" libthr
     grep -aq '/sbin/mount_fusefs' "$lib" || fail "libfuse3 does not run /sbin/mount_fusefs by absolute path (patch 0001)"
     grep -aq 'vfs.usermount' "$lib" || fail "libfuse3 lacks the vfs.usermount check (patch 0001)"
-    "$READELF" --dyn-syms "$lib" | grep -qw unmount || fail "libfuse3 does not unmount with unmount(2)"
+    # The symbol table in a variable: `readelf | grep -q` under pipefail
+    # fails when grep exits before readelf has written everything.
+    local syms
+    syms=$("$READELF" --dyn-syms "$lib")
+    grep -qw unmount <<<"$syms" || fail "libfuse3 does not unmount with unmount(2)"
     note "libfuse3 runs /sbin/mount_fusefs, checks vfs.usermount, unmounts with unmount(2)"
     pc_check fuse3 "$VERSION"
 }

@@ -4,7 +4,8 @@
 # =============================================================================
 #
 # Builds what only Gershwin uses (E24 D6, D8, D12) for ONE architecture, from
-# pinned upstream release tarballs, into the /usr prefix with upstream sonames.
+# pinned upstream release tarballs, into the /usr prefix with upstream sonames
+# (or /usr/X11 for an X client, E24 Q7).
 # Follows the source repo conventions (nextbsd-userland wiki,
 # Source-Repo-Conventions; reference: nextbsd-xlibs' build-xlibs.sh).
 #
@@ -24,15 +25,17 @@
 # Upstream build systems are used as they are, with NextBSD's options; nothing
 # is rewritten as a hand-made makefile. Nothing here uses FreeBSD packages, the
 # ports tree or ports tools, and nothing links against nextbsd-userland: the
-# NextBSD base (compat) sysroot is the only input besides sources.lock. Base
-# already has OpenSSL, zlib, xz, curl and ICU; they are never rebuilt here.
+# NextBSD base (compat) sysroot, with nextbsd-xlibs' artifact in its /usr/X11,
+# is the only input besides sources.lock. Base already has OpenSSL, zlib, xz,
+# curl and ICU; they are never rebuilt here.
 #
 # EXECUTION CONTEXT (set up by CI before this runs)
 #   Inside the nextbsd-kernel-toolchain container (pinned clang/lld 19.1.7 in
 #   $CROSS_BINDIR, meson, ninja, cmake, pkgconf, autotools), with compat's
-#   `continuous` base extracted into $SYSROOT. $SYSROOT is scratch: this script
-#   installs every component into its /usr as it goes (and refuses to replace
-#   a base file).
+#   `continuous` base and nextbsd-xlibs' `continuous` artifact (/usr/X11)
+#   extracted into $SYSROOT. $SYSROOT is scratch: this script installs every
+#   component into it as it goes (and refuses to replace a file that was
+#   already there).
 #
 # USAGE
 #   ./build-gershwin-support.sh          every component, in COMPONENTS order
@@ -63,6 +66,11 @@ PREFIX=/usr
 PC_DIR=/usr/libdata/pkgconfig
 # The only places under /usr a component may install into.
 ALLOWED_DIRS="usr/bin usr/sbin usr/lib usr/libexec usr/include usr/libdata/pkgconfig usr/share/man"
+# An X client (E24 Q7: what needs X goes under /usr/X11) installs beside the
+# X stack nextbsd-xlibs provides, its .pc files where xlibs keeps them.
+X11_PREFIX=/usr/X11
+X11_PC_DIR=/usr/X11/lib/pkgconfig
+X11_ALLOWED_DIRS="usr/X11/bin usr/X11/lib usr/X11/include usr/X11/share/man"
 
 case "$T" in
     amd64) CROSS_TRIPLE=x86_64-unknown-freebsd ;;
@@ -140,6 +148,32 @@ soname_check() {
     "$READELF" -d "$lib" 2>/dev/null | grep -q "SONAME.*\[$want\]" \
         || fail "$lib does not have SONAME $want"
     note "SONAME ok: $want"
+}
+
+# needed_resolves <obj> <dir>...: every DT_NEEDED of a staged object is a file
+# in one of the given sysroot directories (so it resolves on the target where
+# those libraries live).
+needed_resolves() {
+    local obj="$1" lib d found dyn
+    shift
+    dyn=$("$READELF" -d "$obj")
+    for lib in $(sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' <<<"$dyn"); do
+        found=""
+        for d in "$@"; do
+            if [ -e "$SYSROOT/$d/$lib" ]; then found="/$d"; break; fi
+        done
+        [ -n "$found" ] || fail "$(basename "$obj"): DT_NEEDED $lib is in none of: $*"
+        note "DT_NEEDED resolves: $(basename "$obj") -> $found/$lib"
+    done
+}
+
+# no_rpath_check <obj>: no DT_RPATH or DT_RUNPATH (libraries resolve through
+# the system's search path, as for every other X client).
+no_rpath_check() {
+    if "$READELF" -d "$1" | grep -E '\((RPATH|RUNPATH)\)'; then
+        fail "$(basename "$1") carries an RPATH/RUNPATH"
+    fi
+    note "no RPATH/RUNPATH: $(basename "$1")"
 }
 
 # fetch <name>: download (cached in .build/dl), verify and unpack the pinned
@@ -249,39 +283,52 @@ autotools_build() {
     make -C "$COMP_BUILD" install DESTDIR="$COMP_ROOT"
 }
 
-# stage <name>: tidy and check $COMP_ROOT, then copy it into $SYSROOT (for the
-# components after this one) and $DESTDIR (the artifact).
-#   - everything must be under ALLOWED_DIRS (so /usr/local, /etc, info and
-#     locale files are refused);
+# stage <name> [prefix]: tidy and check $COMP_ROOT, then copy it into $SYSROOT
+# (for the components after this one) and $DESTDIR (the artifact). The prefix
+# is /usr (the default) or /usr/X11 (an X client).
+#   - everything must be under that prefix's allowed directories (so
+#     /usr/local, /etc, info and locale files are refused);
 #   - libtool .la files, static archives and docs are dropped;
-#   - .pc files from lib/pkgconfig or share/pkgconfig move to $PC_DIR, and no
-#     .pc file may name /usr/local or a build-host path;
+#   - .pc files from lib/pkgconfig or share/pkgconfig move to the prefix's
+#     pkgconfig directory; each must say prefix=<prefix> (or, if it has no
+#     prefix variable, libdir=<prefix>/lib), and none may name /usr/local or
+#     a build-host path;
 #   - shared objects and programs are stripped with the target strip;
 #     programs are 0555, everything else 0444;
-#   - no staged file may replace a base file in $SYSROOT.
+#   - no staged file may replace a file already in $SYSROOT (the base, or
+#     nextbsd-xlibs' /usr/X11) unless this repo staged it.
 stage() {
-    local name="$1" r="$COMP_ROOT" stray f d rel allowed
-    [ -d "$r$PREFIX" ] || fail "$name installed nothing under $PREFIX"
+    local name="$1" p="${2:-$PREFIX}" r="$COMP_ROOT" stray f d rel allowed pcdir dirs
+    case "$p" in
+        "$PREFIX")     pcdir="$PC_DIR";     dirs="$ALLOWED_DIRS" ;;
+        "$X11_PREFIX") pcdir="$X11_PC_DIR"; dirs="$X11_ALLOWED_DIRS" ;;
+        *)             fail "stage: unsupported prefix $p" ;;
+    esac
+    [ -d "$r$p" ] || fail "$name installed nothing under $p"
     find "$r" \( -name '*.la' -o -name '*.a' \) -delete
-    rm -rf "$r$PREFIX/share/doc"
-    for d in "$r$PREFIX/lib/pkgconfig" "$r$PREFIX/share/pkgconfig"; do
-        [ -d "$d" ] || continue
-        mkdir -p "$r$PC_DIR"
-        mv "$d"/*.pc "$r$PC_DIR/"
+    rm -rf "$r$p/share/doc"
+    for d in "$r$p/lib/pkgconfig" "$r$p/share/pkgconfig"; do
+        [ -d "$d" ] && [ "$d" != "$r$pcdir" ] || continue
+        mkdir -p "$r$pcdir"
+        mv "$d"/*.pc "$r$pcdir/"
         rmdir "$d"
     done
     stray=""
     while IFS= read -r rel; do
         allowed=no
-        for d in $ALLOWED_DIRS; do
+        for d in $dirs; do
             case "$rel" in "$d"/*) allowed=yes; break ;; esac
         done
         [ "$allowed" = yes ] || stray="$stray /$rel"
     done < <(cd "$r" && find . ! -type d | sed 's#^\./##')
-    [ -z "$stray" ] || fail "$name installed outside $ALLOWED_DIRS:$stray"
-    for f in "$r$PC_DIR"/*.pc; do
+    [ -z "$stray" ] || fail "$name installed outside $dirs:$stray"
+    for f in "$r$pcdir"/*.pc; do
         [ -e "$f" ] || continue
-        grep -q "^prefix=$PREFIX\$" "$f" || fail "$(basename "$f"): prefix is not $PREFIX"
+        if grep -q '^prefix=' "$f"; then
+            grep -q "^prefix=$p\$" "$f" || fail "$(basename "$f"): prefix is not $p"
+        else
+            grep -q "^libdir=$p/lib\$" "$f" || fail "$(basename "$f"): neither prefix=$p nor libdir=$p/lib"
+        fi
         if grep -n -F -e /usr/local -e "$ROOT" -e "$SYSROOT" -e "$BUILD" "$f"; then
             fail "$(basename "$f") names /usr/local or a build-host path"
         fi
@@ -290,9 +337,9 @@ stage() {
     find "$r" -type d -exec chmod 0755 {} +
     find "$r" -type f -exec chmod 0444 {} +
     for d in bin sbin libexec; do
-        [ -d "$r$PREFIX/$d" ] || continue
-        find "$r$PREFIX/$d" -type f -exec "$STRIP" {} +
-        find "$r$PREFIX/$d" -type f -exec chmod 0555 {} +
+        [ -d "$r$p/$d" ] || continue
+        find "$r$p/$d" -type f -exec "$STRIP" {} +
+        find "$r$p/$d" -type f -exec chmod 0555 {} +
     done
     find "$r" -type d -empty -delete
     touch "$OWNED"
@@ -562,13 +609,72 @@ build_squashfuse() {
     done
 }
 
+# xdotool (nextbsd/nextbsd-gershwin-support#2) — fakes keyboard and mouse
+# input and manages windows through XTEST; Gershwin's Whisper uses it to type
+# text into windows. An X client, so it installs under /usr/X11 beside the X
+# stack (E24 Q7): /usr/X11/bin/xdotool, libxdo.so.4 (upstream soname) with
+# xdo.h and libxdo.pc, and xdotool.1. Links libX11, libXtst, libXinerama and
+# libxkbcommon from nextbsd-xlibs, which CI unpacks into the sysroot only.
+# BSD-3-Clause.
+#
+# Upstream's plain Makefile, run in its own tree (the unpacked .build/src
+# copy) like zstd's and lz4's. Three of its variables are given on the
+# command line: INC, LIBXDO_LIBS and XDOTOOL_LIBS, from pkgconf through the
+# sysroot, because upstream asks `pkg-config` (never installed here) and
+# otherwise falls back to /usr/local; setting XDOTOOL_LIBS also drops the
+# -lrt upstream adds because `uname` on the runner says Linux (on NextBSD,
+# as on FreeBSD, it adds nothing). WITHOUT_RPATH_FIX=1, upstream's switch, so
+# xdotool has no RPATH: like every other X client, it finds libxdo and the X
+# libraries in /usr/X11/lib through the system's search path (and clang would
+# otherwise take the bare /usr/X11/lib after -Xlinker -rpath as an input file
+# missing on the runner). Only the install targets that put files in place,
+# not `install`, whose post-install step runs the runner's ldconfig. The man
+# page comes from xdotool.pod through pod2man (perl, in the image).
+build_xdotool() {
+    comp "xdotool [upstream Makefile cross]"
+    local xmods="x11 xtst xinerama xkbcommon"
+    # shellcheck disable=SC2086
+    pkgconf --exists $xmods || fail "xdotool needs nextbsd-xlibs ($xmods) in $SYSROOT$X11_PREFIX"
+    fresh_dirs xdotool
+    fetch xdotool
+    local mk
+    # shellcheck disable=SC2086
+    mk=(-C "$SRC_DIR" CC="$CROSS_CC" PREFIX="$X11_PREFIX"
+        INSTALLMAN="$X11_PREFIX/share/man" WITHOUT_RPATH_FIX=1
+        INC="$(pkgconf --cflags $xmods)"
+        LIBXDO_LIBS="$(pkgconf --libs $xmods)"
+        XDOTOOL_LIBS="$(pkgconf --libs x11)"
+        DESTDIR="$COMP_ROOT")
+    make $JOBS "${mk[@]}" all
+    make "${mk[@]}" installlib installprog installman installheader installpc
+    stage xdotool "$X11_PREFIX"
+    local d="$DESTDIR$X11_PREFIX" lib="$DESTDIR$X11_PREFIX/lib/libxdo.so.4" o l
+    test -x "$d/bin/xdotool" || fail "/usr/X11/bin/xdotool not staged"
+    test -s "$d/share/man/man1/xdotool.1" || fail "xdotool.1 not staged"
+    test -f "$d/include/xdo.h" || fail "xdo.h not staged"
+    test -L "$d/lib/libxdo.so" || fail "libxdo.so link not staged"
+    test -e "$lib" || fail "libxdo.so.4 not staged"
+    soname_check "$lib" libxdo.so.4
+    for l in libX11.so.6 libXtst.so.6 libXinerama.so.1 libxkbcommon.so.0; do
+        needed_check "$lib" "$l"
+    done
+    needed_check "$d/bin/xdotool" libxdo.so.4
+    needed_check "$d/bin/xdotool" libX11.so.6
+    not_needed_check "$d/bin/xdotool" librt
+    for o in "$lib" "$d/bin/xdotool"; do
+        needed_resolves "$o" lib usr/lib usr/X11/lib
+        no_rpath_check "$o"
+    done
+    pc_check libxdo "$VERSION"
+}
+
 # =============================================================================
 # driver
 # =============================================================================
 # Add a component: pin it in sources.lock, write build_<name>() above (hyphens
 # in the name become underscores in the function), put its patches, if any, in
 # patches/<name>/ with a series file, and append <name> here in build order.
-COMPONENTS="wget lcms2 zstd lz4 libfuse squashfs-tools-ng squashfuse"
+COMPONENTS="wget lcms2 zstd lz4 libfuse squashfs-tools-ng squashfuse xdotool"
 
 if [ $# -gt 0 ]; then
     for c in "$@"; do
@@ -584,7 +690,7 @@ for t in clang llvm-readelf llvm-strip; do
     [ -x "$CROSS_BINDIR/$t" ] || fail "$CROSS_BINDIR/$t not found (the toolchain image provides it)"
 done
 
-echo "nextbsd-gershwin-support: building [$COMPONENTS] for $T/$TA into $DESTDIR$PREFIX"
+echo "nextbsd-gershwin-support: building [$COMPONENTS] for $T/$TA into $DESTDIR ($PREFIX, $X11_PREFIX)"
 echo "pkgconf searches only: $PKG_CONFIG_LIBDIR"
 mkdir -p "$DESTDIR" "$BUILD"
 # A full run starts from a fresh base sysroot, so it starts a fresh list of

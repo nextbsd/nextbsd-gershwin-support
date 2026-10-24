@@ -3,8 +3,9 @@ name: Build NextBSD gershwin-support
 # Cross-builds what only Gershwin uses (wget, lcms2, the squashfs tools with
 # libfuse3, zstd and lz4, xdotool) for amd64 and arm64 on the x86_64 runner,
 # inside the per-arch nextbsd-kernel-toolchain container, against compat's
-# `continuous` base with nextbsd-xlibs' `continuous` artifact on top as the
-# sysroot, from the pinned tarballs in sources.lock.
+# `continuous` base with nextbsd-displayserver-support's and nextbsd-xlibs'
+# `continuous` artifacts on top as the sysroot, from the pinned tarballs in
+# sources.lock.
 #
 # Every pull request builds both arches. Publishing (nextbsd-gershwin-support-
 # <arch>.tar.gz on the `continuous` release) happens only on a push to main or
@@ -48,14 +49,19 @@ jobs:
       # Stage the cross sysroot, in the order the repos build:
       #   1. compat's base: libc, OpenSSL, zlib and their headers and .pc
       #      files;
-      #   2. nextbsd-xlibs: the X libraries in /usr/X11 that xdotool links
-      #      (libX11, libXtst, libXinerama, libxkbcommon), with their headers
-      #      and .pc files.
-      # Both go into the sysroot only, never into /stage: the artifact holds
+      #   2. nextbsd-displayserver-support, in /usr: libxkbcommon for
+      #      xdotool (with libdrm, pixman, freetype, fontconfig, expat and the
+      #      input stack), .pc files in /usr/libdata/pkgconfig (E25);
+      #   3. nextbsd-xlibs: the X libraries in /usr/X11 that xdotool links
+      #      (libX11, libXtst, libXinerama), with their headers and .pc files.
+      #      Until nextbsd-xlibs#9 it still carries its own /usr/X11 copy of
+      #      libxkbcommon (same version); pkgconf searches
+      #      /usr/libdata/pkgconfig first, so xdotool resolves /usr's.
+      # All go into the sysroot only, never into /stage: the artifact holds
       # what this repo builds. build-gershwin-support.sh installs each
       # component into this sysroot as it goes. Public reads, so the built-in
       # token is enough and fork PRs work.
-      - name: Stage sysroot from compat and xlibs continuous
+      - name: Stage sysroot from compat, displayserver-support and xlibs continuous
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -65,10 +71,14 @@ jobs:
             --pattern "nextbsd-base-${{ matrix.arch }}.tar.gz" \
             --output /tmp/base.tar.gz --clobber
           gh release download continuous \
+            --repo nextbsd/nextbsd-displayserver-support \
+            --pattern "nextbsd-displayserver-support-${{ matrix.arch }}.tar.gz" \
+            --output /tmp/displayserver-support.tar.gz --clobber
+          gh release download continuous \
             --repo nextbsd/nextbsd-xlibs \
             --pattern "nextbsd-xlibs-${{ matrix.arch }}.tar.gz" \
             --output /tmp/xlibs.tar.gz --clobber
-          for t in base xlibs; do
+          for t in base displayserver-support xlibs; do
             tar -C "$GITHUB_WORKSPACE/sysroot" -xzf "/tmp/$t.tar.gz"
           done
 

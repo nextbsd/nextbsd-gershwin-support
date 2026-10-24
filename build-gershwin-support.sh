@@ -25,15 +25,16 @@
 # Upstream build systems are used as they are, with NextBSD's options; nothing
 # is rewritten as a hand-made makefile. Nothing here uses FreeBSD packages, the
 # ports tree or ports tools, and nothing links against nextbsd-userland: the
-# NextBSD base (compat) sysroot, with nextbsd-xlibs' artifact in its /usr/X11,
-# is the only input besides sources.lock. Base already has OpenSSL, zlib, xz,
+# NextBSD base (compat) sysroot, with nextbsd-displayserver-support's artifact
+# in its /usr and nextbsd-xlibs' in its /usr/X11, is the only input besides
+# sources.lock. Base already has OpenSSL, zlib, xz,
 # curl and ICU; they are never rebuilt here.
 #
 # EXECUTION CONTEXT (set up by CI before this runs)
 #   Inside the nextbsd-kernel-toolchain container (pinned clang/lld 19.1.7 in
 #   $CROSS_BINDIR, meson, ninja, cmake, pkgconf, autotools), with compat's
-#   `continuous` base and nextbsd-xlibs' `continuous` artifact (/usr/X11)
-#   extracted into $SYSROOT. $SYSROOT is scratch: this script installs every
+#   `continuous` base, then nextbsd-displayserver-support's (/usr) and
+#   nextbsd-xlibs' (/usr/X11) `continuous` artifacts extracted into $SYSROOT. $SYSROOT is scratch: this script installs every
 #   component into it as it goes (and refuses to replace a file that was
 #   already there).
 #
@@ -86,7 +87,9 @@ export SYSROOT DESTDIR CROSS_BINDIR GS_CROSS
 # pkgconf (ISC, never freedesktop's pkg-config) for this script's own checks
 # and for plain-Makefile builds: the sysroot's .pc directories only, -I/-L
 # prefixed with the sysroot. meson and autotools set the same from the cross
-# files.
+# files. /usr/libdata/pkgconfig comes first, so while nextbsd-xlibs still
+# ships its own /usr/X11 copy of libxkbcommon (until nextbsd-xlibs#9),
+# xkbcommon.pc resolves to nextbsd-displayserver-support's.
 export PKG_CONFIG=pkgconf
 export PKG_CONFIG_LIBDIR="$SYSROOT$PC_DIR:$SYSROOT/usr/X11/lib/pkgconfig"
 export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
@@ -295,8 +298,9 @@ autotools_build() {
 #     a build-host path;
 #   - shared objects and programs are stripped with the target strip;
 #     programs are 0555, everything else 0444;
-#   - no staged file may replace a file already in $SYSROOT (the base, or
-#     nextbsd-xlibs' /usr/X11) unless this repo staged it.
+#   - no staged file may replace a file already in $SYSROOT (the base,
+#     nextbsd-displayserver-support's /usr files, or nextbsd-xlibs' /usr/X11)
+#     unless this repo staged it.
 stage() {
     local name="$1" p="${2:-$PREFIX}" r="$COMP_ROOT" stray f d rel allowed pcdir dirs
     case "$p" in
@@ -613,8 +617,11 @@ build_squashfuse() {
 # input and manages windows through XTEST; Gershwin's Whisper uses it to type
 # text into windows. An X client, so it installs under /usr/X11 beside the X
 # stack (E24 Q7): /usr/X11/bin/xdotool, libxdo.so.4 (upstream soname) with
-# xdo.h and libxdo.pc, and xdotool.1. Links libX11, libXtst, libXinerama and
-# libxkbcommon from nextbsd-xlibs, which CI unpacks into the sysroot only.
+# xdo.h and libxdo.pc, and xdotool.1. Links libX11, libXtst and libXinerama
+# from nextbsd-xlibs and libxkbcommon from nextbsd-displayserver-support
+# (E25), which CI unpacks into the sysroot only. Until nextbsd-xlibs#9 xlibs
+# also carries a /usr/X11 copy of libxkbcommon; pkgconf must resolve
+# xkbcommon.pc in /usr/libdata/pkgconfig, which the build checks.
 # BSD-3-Clause.
 #
 # Upstream's plain Makefile, run in its own tree (the unpacked .build/src
@@ -632,9 +639,14 @@ build_squashfuse() {
 # page comes from xdotool.pod through pod2man (perl, in the image).
 build_xdotool() {
     comp "xdotool [upstream Makefile cross]"
-    local xmods="x11 xtst xinerama xkbcommon"
+    local xmods="x11 xtst xinerama xkbcommon" m
     # shellcheck disable=SC2086
-    pkgconf --exists $xmods || fail "xdotool needs nextbsd-xlibs ($xmods) in $SYSROOT$X11_PREFIX"
+    pkgconf --exists $xmods || fail "xdotool needs $xmods (nextbsd-displayserver-support, nextbsd-xlibs) in $SYSROOT"
+    for m in $xmods; do
+        note "pkgconf path: $m -> $(pkgconf --path "$m" | sed "s#^$SYSROOT##") ($(pkgconf --modversion "$m"))"
+    done
+    [ "$(pkgconf --path xkbcommon)" = "$SYSROOT$PC_DIR/xkbcommon.pc" ] \
+        || fail "xkbcommon resolves to $(pkgconf --path xkbcommon), not nextbsd-displayserver-support's $SYSROOT$PC_DIR/xkbcommon.pc"
     fresh_dirs xdotool
     fetch xdotool
     local mk
@@ -645,6 +657,8 @@ build_xdotool() {
         LIBXDO_LIBS="$(pkgconf --libs $xmods)"
         XDOTOOL_LIBS="$(pkgconf --libs x11)"
         DESTDIR="$COMP_ROOT")
+    note "INC=$(pkgconf --cflags $xmods | sed "s#$SYSROOT##g")"
+    note "LIBXDO_LIBS=$(pkgconf --libs $xmods | sed "s#$SYSROOT##g")"
     make $JOBS "${mk[@]}" all
     make "${mk[@]}" installlib installprog installman installheader installpc
     stage xdotool "$X11_PREFIX"

@@ -8,13 +8,15 @@
 
 : "${SYSROOT:?}" "${CROSS_BINDIR:?}" "${gs_triple:?}"
 
-# The cross compiler. -fuse-ld=lld goes in LDFLAGS (link only); clang finds
-# ld.lld beside itself.
-CC="$CROSS_BINDIR/clang --target=$gs_triple --sysroot=$SYSROOT"
-CXX="$CROSS_BINDIR/clang++ --target=$gs_triple --sysroot=$SYSROOT"
+# The cross compiler. -fuse-ld=lld is part of CC/CXX, not LDFLAGS: older
+# bundled libtool (e.g. gmp's, libao's) drops it from LDFLAGS on link lines,
+# so arm64 then links with the runner's x86 ld and amd64 silently with GNU ld.
+# clang finds ld.lld beside itself; the flag is ignored when only compiling.
+CC="$CROSS_BINDIR/clang --target=$gs_triple --sysroot=$SYSROOT -fuse-ld=lld"
+CXX="$CROSS_BINDIR/clang++ --target=$gs_triple --sysroot=$SYSROOT -fuse-ld=lld"
 CFLAGS="${CFLAGS:--O2 -pipe}"
 CXXFLAGS="${CXXFLAGS:--O2 -pipe}"
-LDFLAGS="-fuse-ld=lld ${LDFLAGS:-}"
+LDFLAGS="${LDFLAGS:-}"
 AR="$CROSS_BINDIR/llvm-ar"
 RANLIB="$CROSS_BINDIR/llvm-ranlib"
 NM="$CROSS_BINDIR/llvm-nm"

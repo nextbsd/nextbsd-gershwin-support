@@ -23,11 +23,13 @@ A component belongs in this repo when all of these hold:
    FreeBSD packages, ports or ports tools.
 3. **It links only against what is built before it**: the NextBSD base
    (OpenSSL 3.5, zlib, xz, curl and ICU are already there and are never
-   rebuilt here), the E23/E24 repos it is ordered after, and libraries built
-   earlier in this repo.
+   rebuilt here), the E23/E24 repos it is ordered after (nextbsd-xlibs for
+   the X libraries), and libraries built earlier in this repo.
 4. **It installs under `/usr`**, with upstream's sonames, its `.pc` files in
    `/usr/libdata/pkgconfig` as base does, and no static or libtool archives.
-   Never `/usr/local` (E24 Q7). A component that needs X goes under `/usr/X11`.
+   Never `/usr/local` (E24 Q7). A component that needs X goes under `/usr/X11`
+   (`bin`, `lib`, `include`, `share/man`), its `.pc` files in
+   `/usr/X11/lib/pkgconfig` as nextbsd-xlibs does.
 5. **It ships no `/etc`.** Configuration, if any, comes from
    `nextbsd-overlays`.
 6. **No D-Bus or Avahi** (E24 D2): any build option that pulls them in is off.
@@ -43,9 +45,10 @@ A component belongs in this repo when all of these hold:
 | `libfuse` | libfuse 3.18.3, library only, with patch 0001 for user mounts (below) | `/usr/lib/libfuse3.so.4`, `/usr/include/fuse3/`, `fuse3.pc` | nextbsd/nextbsd-gershwin-support#3 |
 | `squashfs-tools-ng` | squashfs-tools-ng 1.3.2: libsquashfs (AppImage icons and `.desktop` files without mounting) and the tools; gzip, xz, lz4, zstd and bzip2, no LZO | `/usr/lib/libsquashfs.so.1`, `/usr/include/sqfs/`, `libsquashfs1.pc`; `gensquashfs`, `rdsquashfs`, `sqfs2tar`, `sqfsdiff`, `tar2sqfs` and their man pages | nextbsd/nextbsd-gershwin-support#3 |
 | `squashfuse` | squashfuse 0.6.5 on libfuse3, the same decompressors | `/usr/bin/squashfuse`, `/usr/bin/squashfuse_ll` and their man pages | nextbsd/nextbsd-gershwin-support#3 |
+| `xdotool` | xdotool 4.20260303.1 (Gershwin's Whisper types text into windows with it), on libX11, libXtst, libXinerama and libxkbcommon from nextbsd-xlibs. An X client, so under `/usr/X11` | `/usr/X11/bin/xdotool`, `/usr/X11/lib/libxdo.so.4`, `/usr/X11/include/xdo.h`, `/usr/X11/lib/pkgconfig/libxdo.pc`, `xdotool.1` | nextbsd/nextbsd-gershwin-support#2 |
 
-Planned: `xdotool` (#2). Licences are per component; see `NOTICE.md`. The
-top-level `LICENSE` (BSD-2) covers only the harness in this repo.
+Licences are per component; see `NOTICE.md`. The top-level `LICENSE` (BSD-2)
+covers only the harness in this repo.
 
 ## Mounting a squashfs image as a user
 
@@ -111,14 +114,15 @@ builds, install roots and the generated cross file) is scratch and ignored.
 
 `build-gershwin-support.sh` runs inside the `nextbsd-kernel-toolchain`
 container (clang/lld 19.1.7 and the LLVM binutils, meson, ninja, cmake,
-pkgconf, autotools) with compat's `continuous` base staged as the cross
-sysroot. It needs:
+pkgconf, autotools) with compat's `continuous` base and nextbsd-xlibs'
+`continuous` artifact (`/usr/X11`) staged as the cross sysroot. The xlibs
+files are only built against: the artifact never carries them. It needs:
 
 | Variable | Meaning |
 |---|---|
 | `T` | target: `amd64` or `arm64` |
 | `TA` | FreeBSD `TARGET_ARCH`: `amd64` or `aarch64` |
-| `SYSROOT` | the staged NextBSD base (scratch: components are installed into it) |
+| `SYSROOT` | the staged NextBSD base with nextbsd-xlibs in `/usr/X11` (scratch: components are installed into it) |
 | `CROSS_BINDIR` | the toolchain's clang, lld and LLVM tools (set by the image) |
 | `DESTDIR` | where to stage the artifact; default `/stage` |
 
@@ -134,22 +138,28 @@ For each component, in `COMPONENTS` order, one `build_<name>()`:
    meson with a cross file generated per run (sysroot and LLVM paths) followed
    by `cross/meson/<arch>.ini`; autotools with `--host=<triple>`,
    `--with-sysroot` and `CONFIG_SITE=cross/autotools/<arch>.site`; or a
-   plain upstream Makefile told the target OS and compiler (zstd and lz4,
-   which have no configure; `uname` on the runner says Linux).
+   plain upstream Makefile told the target OS and compiler (zstd, lz4 and
+   xdotool, which have no configure; `uname` on the runner says Linux).
+   xdotool's Makefile is also given its X compiler and linker flags from
+   pkgconf, since it would ask `pkg-config` and fall back to `/usr/local`.
 4. **Stage**: check and tidy the install, then copy it into `$SYSROOT`, so
    later components find its headers, libraries and `.pc` files through the
    normal sysroot search, and into `$DESTDIR`, the published artifact.
 
 **Checks the build enforces:** nothing installs outside `/usr/bin`, `/usr/sbin`,
 `/usr/lib`, `/usr/libexec`, `/usr/include`, `/usr/libdata/pkgconfig` and
-`/usr/share/man` (so no `/usr/local`, `/etc`, info or locale files); no
-staged file replaces a base file in the sysroot; `.pc` files are moved to
-`/usr/libdata/pkgconfig`, must say `prefix=/usr` and may not name `/usr/local`
-or a build path; libraries carry their upstream soname and link what they
-should, and the minimal builds link none of the optional libraries they leave
-out (cross `readelf -d`); pkgconf (never freedesktop's pkg-config, E24 D1)
-searches only the sysroot (`/usr/libdata/pkgconfig`, and `/usr/X11/lib/pkgconfig`
-once nextbsd-xlibs is in it). Static and libtool archives are dropped,
+`/usr/share/man`, or for an X client `/usr/X11/bin`, `/usr/X11/lib`,
+`/usr/X11/include` and `/usr/X11/share/man` (so no `/usr/local`, `/etc`, info
+or locale files); no staged file replaces a file already in the sysroot (the
+base, or nextbsd-xlibs' `/usr/X11`); `.pc` files are moved to the prefix's
+pkgconfig directory, must say `prefix=` that prefix (or, with no `prefix`
+variable, `libdir=<prefix>/lib`) and may not name `/usr/local` or a build
+path; libraries carry their upstream soname and link what they should, and
+the minimal builds link none of the optional libraries they leave out (cross
+`readelf -d`); xdotool's every `DT_NEEDED` is a library in the sysroot's
+`/lib`, `/usr/lib` or `/usr/X11/lib`, and it carries no RPATH; pkgconf (never
+freedesktop's pkg-config, E24 D1) searches only the sysroot
+(`/usr/libdata/pkgconfig` and `/usr/X11/lib/pkgconfig`). Static and libtool archives are dropped,
 objects are stripped with the target strip, programs are `0555` and the rest
 `0444`.
 

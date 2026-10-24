@@ -1,10 +1,10 @@
 name: Build NextBSD gershwin-support
 
 # Cross-builds what only Gershwin uses (wget, lcms2, the squashfs tools with
-# libfuse3, zstd and lz4; later xdotool) for amd64 and arm64 on the x86_64
-# runner, inside the per-arch nextbsd-kernel-toolchain container, against
-# compat's `continuous` base as the sysroot, from the pinned tarballs in
-# sources.lock.
+# libfuse3, zstd and lz4, xdotool) for amd64 and arm64 on the x86_64 runner,
+# inside the per-arch nextbsd-kernel-toolchain container, against compat's
+# `continuous` base with nextbsd-xlibs' `continuous` artifact on top as the
+# sysroot, from the pinned tarballs in sources.lock.
 #
 # Every pull request builds both arches. Publishing (nextbsd-gershwin-support-
 # <arch>.tar.gz on the `continuous` release) happens only on a push to main or
@@ -45,11 +45,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Stage the cross sysroot from compat's `continuous` base: libc, OpenSSL,
-      # zlib and their headers and .pc files. build-gershwin-support.sh installs
-      # each component into this sysroot's /usr as it goes. A public read, so
-      # the built-in token is enough and fork PRs work.
-      - name: Stage sysroot from compat continuous
+      # Stage the cross sysroot, in the order the repos build:
+      #   1. compat's base: libc, OpenSSL, zlib and their headers and .pc
+      #      files;
+      #   2. nextbsd-xlibs: the X libraries in /usr/X11 that xdotool links
+      #      (libX11, libXtst, libXinerama, libxkbcommon), with their headers
+      #      and .pc files.
+      # Both go into the sysroot only, never into /stage: the artifact holds
+      # what this repo builds. build-gershwin-support.sh installs each
+      # component into this sysroot as it goes. Public reads, so the built-in
+      # token is enough and fork PRs work.
+      - name: Stage sysroot from compat and xlibs continuous
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -58,7 +64,13 @@ jobs:
             --repo nextbsd/nextbsd-freebsd-compat \
             --pattern "nextbsd-base-${{ matrix.arch }}.tar.gz" \
             --output /tmp/base.tar.gz --clobber
-          tar -C "$GITHUB_WORKSPACE/sysroot" -xzf /tmp/base.tar.gz
+          gh release download continuous \
+            --repo nextbsd/nextbsd-xlibs \
+            --pattern "nextbsd-xlibs-${{ matrix.arch }}.tar.gz" \
+            --output /tmp/xlibs.tar.gz --clobber
+          for t in base xlibs; do
+            tar -C "$GITHUB_WORKSPACE/sysroot" -xzf "/tmp/$t.tar.gz"
+          done
 
       # The pinned tarballs, keyed on sources.lock. The build re-checks every
       # SHA-256 whether the file came from here or from upstream.

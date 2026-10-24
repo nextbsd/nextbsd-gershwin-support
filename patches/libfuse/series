@@ -1,0 +1,2 @@
+# libfuse 3.18.3: NextBSD changes, applied in order (see each Origin: line).
+0001-mount_bsd-absolute-mount_fusefs-user-mounts.patch

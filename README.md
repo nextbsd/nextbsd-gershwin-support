@@ -38,10 +38,55 @@ A component belongs in this repo when all of these hold:
 |---|---|---|---|
 | `wget` | GNU wget 1.25.0, minimal (D8): base OpenSSL and zlib; no NLS, libpsl, libidn2, PCRE/PCRE2, c-ares, metalink, libuuid or libproxy | `/usr/bin/wget`, `wget.1` | nextbsd/nextbsd-gershwin-support#1 |
 | `lcms2` | Little CMS 2.19.1, library only (Gershwin's Color pane) | `/usr/lib/liblcms2.so.2`, `lcms2.h`, `lcms2_plugin.h`, `lcms2.pc` | nextbsd/nextbsd-gershwin-support#1 |
+| `zstd` | Zstandard 1.5.7, library only (base has only its private `libprivatezstd`) | `/usr/lib/libzstd.so.1`, `zstd.h`, `zstd_errors.h`, `zdict.h`, `libzstd.pc` | nextbsd/nextbsd-gershwin-support#3 |
+| `lz4` | LZ4 1.10.0, library only | `/usr/lib/liblz4.so.1`, `lz4.h`, `lz4hc.h`, `lz4frame.h`, `liblz4.pc` | nextbsd/nextbsd-gershwin-support#3 |
+| `libfuse` | libfuse 3.18.3, library only, with patch 0001 for user mounts (below) | `/usr/lib/libfuse3.so.4`, `/usr/include/fuse3/`, `fuse3.pc` | nextbsd/nextbsd-gershwin-support#3 |
+| `squashfs-tools-ng` | squashfs-tools-ng 1.3.2: libsquashfs (AppImage icons and `.desktop` files without mounting) and the tools; gzip, xz, lz4, zstd and bzip2, no LZO | `/usr/lib/libsquashfs.so.1`, `/usr/include/sqfs/`, `libsquashfs1.pc`; `gensquashfs`, `rdsquashfs`, `sqfs2tar`, `sqfsdiff`, `tar2sqfs` and their man pages | nextbsd/nextbsd-gershwin-support#3 |
+| `squashfuse` | squashfuse 0.6.5 on libfuse3, the same decompressors | `/usr/bin/squashfuse`, `/usr/bin/squashfuse_ll` and their man pages | nextbsd/nextbsd-gershwin-support#3 |
 
-Planned: `xdotool` (#2) and the squashfs tools with libfuse3, zstd and lz4
-(#3). Licences are per component; see `NOTICE.md`. The top-level `LICENSE`
-(BSD-2) covers only the harness in this repo.
+Planned: `xdotool` (#2). Licences are per component; see `NOTICE.md`. The
+top-level `LICENSE` (BSD-2) covers only the harness in this repo.
+
+## Mounting a squashfs image as a user
+
+Exactly what an AppImage's type-2 runtime does on Linux (E24 D12), with no
+DiskArbitration and no `/Volumes`: the mount point is private, and the user
+never sees it. For an image such as `Firefox.AppImage` or `Firefox.squashfs`,
+as the user:
+
+1. `mkdtemp("$TMPDIR/.mount_FirefoXXXXXX")`: `.mount_`, the first six
+   characters of the file name, then the random part; `$TMPDIR` defaults to
+   `/tmp`. The directory belongs to the user, mode `0700`.
+2. Mount the squashfs payload there read-only through libfuse:
+   `squashfuse -o ro[,offset=N] <image> <dir>` (`offset=` is where an
+   AppImage's payload starts after its ELF runtime). libfuse opens
+   `/dev/fuse` and runs `/sbin/mount_fusefs`, which mounts as the user.
+3. Set `APPDIR=<dir>` and run the application from it.
+4. When it exits, unmount as the same user, `umount <dir>` (`unmount(2)`;
+   no setuid `fusermount` exists or is needed), or end the `squashfuse`
+   process, which then unmounts with `unmount(2)` itself. Then
+   `rmdir <dir>`.
+
+What makes that work for a normal user on NextBSD:
+
+- **Kernel:** FUSE is compiled in (`options FUSEFS`, nextbsd/nextbsd-kernel#60)
+  and `vfs.usermount=1` is the default (nextbsd-kernel patch 0008), so a user
+  may mount on, and unmount, a directory they own. A user mount is always
+  `nosuid`. `allow_other` stays root-only, and isn't needed.
+- **`/dev/fuse`:** the kernel creates it `0666 root:operator`, and neither the
+  base nor nextbsd-overlays has a devfs rule that changes it, so no
+  configuration is needed.
+- **libfuse (patch `patches/libfuse/0001`):** runs `/sbin/mount_fusefs` by
+  absolute path (upstream looks it up in `PATH`, which for a user usually
+  lacks `/sbin`); before mounting, checks it can run it, that
+  `vfs.usermount` is 1 and that the user owns the mount point, and on a
+  failure to open `/dev/fuse` says whether access or kernel support is
+  missing; and treats an `unmount(2)` of a file system the user already
+  unmounted as done rather than an error.
+
+The AppImage runtime and Gershwin's Workspace (opening a plain `.squashfs`)
+each carry out these steps themselves; this repo provides the library and the
+programs they use.
 
 ## Layout
 
@@ -89,7 +134,8 @@ For each component, in `COMPONENTS` order, one `build_<name>()`:
    meson with a cross file generated per run (sysroot and LLVM paths) followed
    by `cross/meson/<arch>.ini`; autotools with `--host=<triple>`,
    `--with-sysroot` and `CONFIG_SITE=cross/autotools/<arch>.site`; or a
-   plain upstream Makefile told the target OS and compiler (zstd, lz4).
+   plain upstream Makefile told the target OS and compiler (zstd and lz4,
+   which have no configure; `uname` on the runner says Linux).
 4. **Stage**: check and tidy the install, then copy it into `$SYSROOT`, so
    later components find its headers, libraries and `.pc` files through the
    normal sysroot search, and into `$DESTDIR`, the published artifact.

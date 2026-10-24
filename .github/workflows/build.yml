@@ -1,9 +1,10 @@
 name: Build NextBSD gershwin-support
 
-# Cross-builds what only Gershwin uses (wget, lcms2; later xdotool and the
-# squashfs tools) for amd64 and arm64 on the x86_64 runner, inside the per-arch
-# nextbsd-kernel-toolchain container, against compat's `continuous` base as the
-# sysroot, from the pinned tarballs in sources.lock.
+# Cross-builds what only Gershwin uses (wget, lcms2, the squashfs tools with
+# libfuse3, zstd and lz4; later xdotool) for amd64 and arm64 on the x86_64
+# runner, inside the per-arch nextbsd-kernel-toolchain container, against
+# compat's `continuous` base as the sysroot, from the pinned tarballs in
+# sources.lock.
 #
 # Every pull request builds both arches. Publishing (nextbsd-gershwin-support-
 # <arch>.tar.gz on the `continuous` release) happens only on a push to main or

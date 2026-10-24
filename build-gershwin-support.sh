@@ -545,8 +545,13 @@ build_squashfuse() {
         --disable-demo --without-lzo
     make -C "$COMP_BUILD" $JOBS
     make -C "$COMP_BUILD" install-binPROGRAMS install-man DESTDIR="$COMP_ROOT"
+    # automake makes install-binPROGRAMS depend on install-libLTLIBRARIES,
+    # which puts libsquashfuse and libsquashfuse_ll in place as well; the
+    # programs don't link them (checked below), so they are dropped.
+    rm -f "$COMP_ROOT$PREFIX"/lib/libsquashfuse*
     stage squashfuse
     local d="$DESTDIR$PREFIX" p l
+    ! ls "$d"/lib/libsquashfuse* >/dev/null 2>&1 || fail "libsquashfuse was staged"
     for p in squashfuse squashfuse_ll; do
         test -x "$d/bin/$p" || fail "/usr/bin/$p not staged"
         test -s "$d/share/man/man1/$p.1" || fail "$p.1 not staged"

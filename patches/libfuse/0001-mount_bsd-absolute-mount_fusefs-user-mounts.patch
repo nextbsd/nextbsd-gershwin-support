@@ -1,0 +1,151 @@
+Description: NextBSD user mounts: run /sbin/mount_fusefs by absolute path,
+ explain why a mount cannot work, and treat an already-unmounted file system
+ as unmounted.
+ .
+ Model: what an AppImage does on Linux. A normal user creates a private
+ mkdtemp(3) directory, mounts a squashfs image there read-only through
+ libfuse (squashfuse), and unmounts it again as the same user.
+ .
+ - mount_fusefs was run with execvp() by name, so it was only found when
+   /sbin was on PATH, which it usually is not for a normal user. It is now
+   run as /sbin/mount_fusefs with execv() (also for fuse_mount_version()).
+ - Before running it: the program must be executable; for a non-root caller
+   the vfs.usermount sysctl must be 1 (the NextBSD default) and the caller
+   must own the mount point. Each gives a one-line reason instead of
+   mount_fusefs's bare "Operation not permitted".
+ - Opening /dev/fuse: EACCES/EPERM says a normal user needs read/write
+   access (devfs creates it 0666); ENOENT/ENXIO/ENODEV says the kernel has
+   no fusefs.
+ - fuse_kern_unmount() already uses unmount(2), which the mounting user may
+   call with vfs.usermount=1, so no setuid fusermount is needed. It no longer
+   logs an error when the file system is already gone (EINVAL/ENOENT), which
+   is the normal case after the user ran umount(8) on the mount point.
+Origin: NextBSD
+Reference: FreeBSD ports filesystems/fusefs-libs3 3.18.3 (read only): it
+ carries no patch to lib/mount_bsd.c and relies on /sbin being on PATH.
+Forwarded: no
+Bug: https://github.com/nextbsd/nextbsd-gershwin-support/issues/3
+
+--- a/lib/mount_bsd.c
++++ b/lib/mount_bsd.c
+@@ -17,6 +17,8 @@
+ #include <sys/param.h>
+ #include "fuse_mount_compat.h"
+ 
++#include <sys/stat.h>
++#include <sys/sysctl.h>
+ #include <sys/wait.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -26,7 +28,12 @@
+ #include <errno.h>
+ #include <string.h>
+ 
+-#define FUSERMOUNT_PROG		"mount_fusefs"
++/*
++ * NextBSD: run the base system's mount_fusefs by absolute path. Looking it up
++ * through PATH fails for a normal user whose PATH lacks /sbin, and must not
++ * pick up another program of that name.
++ */
++#define FUSERMOUNT_PROG		"/sbin/mount_fusefs"
+ #define FUSE_DEV_TRUNK		"/dev/fuse"
+ 
+ enum {
+@@ -126,9 +133,52 @@
+ {
+ 	if (close(fd) < 0)
+ 		fuse_log(FUSE_LOG_ERR, "closing FD %d failed: %s", fd, strerror(errno));
+-	if (unmount(mountpoint, MNT_FORCE) < 0)
+-		fuse_log(FUSE_LOG_ERR, "unmounting %s failed: %s",
++	/*
++	 * NextBSD: unmount(2) needs no helper and works for the user who
++	 * mounted (vfs.usermount=1). EINVAL or ENOENT means the file system
++	 * is already gone, e.g. the user ran umount(8) on the mount point
++	 * first, which is how a mount is normally ended: not an error.
++	 */
++	if (unmount(mountpoint, MNT_FORCE) < 0 &&
++	    errno != EINVAL && errno != ENOENT)
++		fuse_log(FUSE_LOG_ERR, "unmounting %s failed: %s\n",
+ 			mountpoint, strerror(errno));
++}
++
++/*
++ * NextBSD: say clearly why a mount cannot work before running mount_fusefs,
++ * whose own errors do not name the cause. A normal user may mount when
++ * /dev/fuse is readable and writable (devfs creates it 0666), the
++ * vfs.usermount sysctl is 1 (the NextBSD default) and the user owns the
++ * mount point (e.g. a mkdtemp(3) directory).
++ */
++static int fuse_mount_preflight(const char *mountpoint)
++{
++	struct stat st;
++	int usermount;
++	size_t len;
++
++	if (access(FUSERMOUNT_PROG, X_OK) != 0) {
++		fuse_log(FUSE_LOG_ERR, "fuse: cannot run %s: %s\n",
++			FUSERMOUNT_PROG, strerror(errno));
++		return -1;
++	}
++	if (geteuid() == 0)
++		return 0;
++	usermount = 0;
++	len = sizeof(usermount);
++	if (sysctlbyname("vfs.usermount", &usermount, &len, NULL, 0) == 0 &&
++	    usermount == 0) {
++		fuse_log(FUSE_LOG_ERR, "fuse: mounting as a normal user needs "
++			"the vfs.usermount sysctl set to 1\n");
++		return -1;
++	}
++	if (stat(mountpoint, &st) == 0 && st.st_uid != geteuid()) {
++		fuse_log(FUSE_LOG_ERR, "fuse: %s: a normal user can only mount "
++			"on a directory they own\n", mountpoint);
++		return -1;
++	}
++	return 0;
+ }
+ 
+ static int fuse_mount_core(const char *mountpoint, const char *opts)
+@@ -158,7 +208,20 @@
+ 		dev = (char *)FUSE_DEV_TRUNK;
+ 
+ 	if ((fd = open(dev, O_RDWR)) < 0) {
+-		perror("fuse: failed to open fuse device");
++		/* NextBSD: a clear error for the usual causes. */
++		int e = errno;
++
++		if (e == EACCES || e == EPERM)
++			fuse_log(FUSE_LOG_ERR, "fuse: cannot open %s: %s "
++				"(a normal user needs read and write access to "
++				"it; devfs creates it 0666)\n", dev, strerror(e));
++		else if (e == ENOENT || e == ENXIO || e == ENODEV)
++			fuse_log(FUSE_LOG_ERR, "fuse: cannot open %s: %s "
++				"(the kernel has no fusefs support)\n", dev,
++				strerror(e));
++		else
++			fuse_log(FUSE_LOG_ERR, "fuse: failed to open fuse "
++				"device %s: %s\n", dev, strerror(e));
+ 		return -1;
+ 	}
+ 
+@@ -166,6 +229,11 @@
+ 	if (getenv("FUSE_NO_MOUNT") || ! mountpoint)
+ 		goto out;
+ 
++	if (fuse_mount_preflight(mountpoint) != 0) {
++		close(fd);
++		return -1;
++	}
++
+ 	pid = fork();
+ 	cpid = pid;
+ 
+@@ -208,7 +276,7 @@
+ 			argv[a++] = fdnam;
+ 			argv[a++] = mountpoint;
+ 			argv[a++] = NULL;
+-			execvp(mountprog, (char **) argv);
++			execv(mountprog, (char **) argv);
+ 			perror("fuse: failed to exec mount program");
+ 			free(fdnam);
+ 			_exit(EXIT_FAILURE);

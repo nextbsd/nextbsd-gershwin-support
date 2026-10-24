@@ -95,6 +95,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 READELF="$CROSS_BINDIR/llvm-readelf"
 STRIP="$CROSS_BINDIR/llvm-strip"
+# The cross compiler for upstream plain Makefiles (zstd, lz4), the same as
+# CC in cross/autotools/common.site: -fuse-ld=lld in the compiler command.
+CROSS_CC="$CROSS_BINDIR/clang --target=$CROSS_TRIPLE --sysroot=$SYSROOT -fuse-ld=lld"
 
 # lock_field <name> <version|sha256|url>: a component's pin from sources.lock.
 lock_field() {
@@ -386,13 +389,186 @@ build_lcms2() {
     pc_check lcms2 2.19
 }
 
+# ---- squashfs: AppImage integration (nextbsd/nextbsd-gershwin-support#3) ----
+# squashfs-tools-ng and squashfuse (E24 D12) with the three libraries they need
+# that the base has no public copy of: zstd and lz4 (base builds zstd only as
+# its private libprivatezstd, and lz4 not at all in userland) and libfuse3
+# (base has the kernel side, `options FUSEFS`, and /sbin/mount_fusefs only).
+# zlib, liblzma and libbz2 come from the base. The libraries install with
+# upstream's sonames and .pc files, so the overwrite check in stage() keeps
+# them clear of base's private copies.
+
+# zstd — Zstandard, the library only, with upstream's lib/Makefile (zstd has
+# no configure): libzstd.so.1, zstd.h, zstd_errors.h, zdict.h, libzstd.pc.
+# Multithreaded, as upstream builds the shared library (links libthr). Not
+# the programs: base has /usr/bin/zstd on its private copy. The Makefile picks
+# the platform from `uname`, which is the Linux runner here, so UNAME=FreeBSD
+# selects the ELF soname flags and /usr/libdata/pkgconfig. Upstream's
+# Makefile builds in its own tree (the unpacked .build/src copy). No static
+# library. BSD-3-Clause (upstream offers BSD or GPL-2.0).
+build_zstd() {
+    comp "zstd [upstream lib/Makefile cross]"
+    fresh_dirs zstd
+    fetch zstd
+    local f mk=(-C "$SRC_DIR/lib" UNAME=FreeBSD CC="$CROSS_CC"
+              AR="$CROSS_BINDIR/llvm-ar" PREFIX="$PREFIX" DESTDIR="$COMP_ROOT")
+    make $JOBS "${mk[@]}" libzstd-release libzstd.pc
+    make "${mk[@]}" install-shared install-includes install-pc
+    stage zstd
+    local d="$DESTDIR$PREFIX"
+    for f in zstd.h zstd_errors.h zdict.h; do
+        test -f "$d/include/$f" || fail "$f not staged"
+    done
+    test -L "$d/lib/libzstd.so" || fail "libzstd.so link not staged"
+    test -e "$d/lib/libzstd.so.1" || fail "libzstd.so.1 not staged"
+    soname_check "$d/lib/libzstd.so.1" libzstd.so.1
+    needed_check "$d/lib/libzstd.so.1" libthr
+    pc_check libzstd "$VERSION"
+}
+
+# lz4 — LZ4, the library only, with upstream's lib/Makefile: liblz4.so.1,
+# lz4.h, lz4hc.h, lz4frame.h, liblz4.pc. TARGET_OS=FreeBSD for the same reason
+# as zstd's UNAME; BUILD_STATIC=no, so no liblz4.a (and so none of the
+# headers upstream installs only beside it). The lz4 program is GPL-2.0 and
+# is not built. Library BSD-2-Clause.
+build_lz4() {
+    comp "lz4 [upstream lib/Makefile cross]"
+    fresh_dirs lz4
+    fetch lz4
+    local f mk=(-C "$SRC_DIR/lib" TARGET_OS=FreeBSD BUILD_STATIC=no CC="$CROSS_CC"
+              AR="$CROSS_BINDIR/llvm-ar" PREFIX="$PREFIX" DESTDIR="$COMP_ROOT")
+    make $JOBS "${mk[@]}" lib-release
+    make "${mk[@]}" install
+    stage lz4
+    local d="$DESTDIR$PREFIX"
+    for f in lz4.h lz4hc.h lz4frame.h; do
+        test -f "$d/include/$f" || fail "$f not staged"
+    done
+    test -L "$d/lib/liblz4.so" || fail "liblz4.so link not staged"
+    test -e "$d/lib/liblz4.so.1" || fail "liblz4.so.1 not staged"
+    soname_check "$d/lib/liblz4.so.1" liblz4.so.1
+    pc_check liblz4 "$VERSION"
+}
+
+# libfuse — libfuse3, the library only, meson: libfuse3.so.4, the fuse3/
+# headers, fuse3.pc. On a BSD upstream never builds fusermount3 or mount.fuse3
+# (-Dutils=false says so); libfuse mounts by running base's mount_fusefs and
+# unmounts with unmount(2). No examples, tests or io_uring. LGPL-2.1.
+#
+# patches/libfuse/0001 (Origin: NextBSD) makes that work for a normal user,
+# the way an AppImage mounts its payload on Linux: mount_fusefs is run as
+# /sbin/mount_fusefs by absolute path (a user's PATH usually lacks /sbin);
+# /dev/fuse access, vfs.usermount and mount point ownership are checked first
+# with a clear error; and an unmount(2) of a file system the user already
+# unmounted is not an error. The checks below make sure the patched code is
+# what was built.
+build_libfuse() {
+    comp "libfuse [meson cross]"
+    fresh_dirs libfuse
+    fetch libfuse
+    meson_build \
+        -Dutils=false -Dexamples=false -Dtests=false \
+        -Denable-io-uring=false -Denable-usdt=false
+    stage libfuse
+    local d="$DESTDIR$PREFIX" lib f
+    for f in fuse.h fuse_common.h fuse_lowlevel.h fuse_opt.h; do
+        test -f "$d/include/fuse3/$f" || fail "fuse3/$f not staged"
+    done
+    test -L "$d/lib/libfuse3.so" || fail "libfuse3.so link not staged"
+    lib="$d/lib/libfuse3.so.4"
+    test -e "$lib" || fail "libfuse3.so.4 not staged"
+    soname_check "$lib" libfuse3.so.4
+    needed_check "$lib" libthr
+    grep -aq '/sbin/mount_fusefs' "$lib" || fail "libfuse3 does not run /sbin/mount_fusefs by absolute path (patch 0001)"
+    grep -aq 'vfs.usermount' "$lib" || fail "libfuse3 lacks the vfs.usermount check (patch 0001)"
+    # The symbol table in a variable: `readelf | grep -q` under pipefail
+    # fails when grep exits before readelf has written everything.
+    local syms
+    syms=$("$READELF" --dyn-syms "$lib")
+    grep -qw unmount <<<"$syms" || fail "libfuse3 does not unmount with unmount(2)"
+    note "libfuse3 runs /sbin/mount_fusefs, checks vfs.usermount, unmounts with unmount(2)"
+    pc_check fuse3 "$VERSION"
+}
+
+# squashfs-tools-ng — libsquashfs (LGPL-3.0-or-later), which Gershwin's
+# Workspace and make_services use to read AppImage icons and .desktop files
+# without mounting, and the five tools (GPL-3.0-or-later: fine in this
+# optional package, E24 D12): gensquashfs, rdsquashfs, sqfs2tar, sqfsdiff,
+# tar2sqfs. autotools. Every squashfs compressor except LZO (GPL-2.0, and
+# AppImages do not use it): gzip and xz from the base, lz4 and zstd from this
+# repo (all found through pkgconf in the sysroot), bzip2 from the base for
+# tarballs. No SELinux, no Doxygen. No configure check runs a target program.
+build_squashfs_tools_ng() {
+    comp "squashfs-tools-ng [autotools cross]"
+    dep_check squashfs-tools-ng libzstd.so liblz4.so
+    fresh_dirs squashfs-tools-ng
+    fetch squashfs-tools-ng
+    autotools_build \
+        --with-gzip --with-xz --with-lz4 --with-zstd --with-bzip2 \
+        --without-lzo --without-selinux --with-tools \
+        --disable-doxygen-doc
+    stage squashfs-tools-ng
+    local d="$DESTDIR$PREFIX" t
+    for t in gensquashfs rdsquashfs sqfs2tar sqfsdiff tar2sqfs; do
+        test -x "$d/bin/$t" || fail "/usr/bin/$t not staged"
+        test -s "$d/share/man/man1/$t.1" || fail "$t.1 not staged"
+        needed_check "$d/bin/$t" libsquashfs.so.1
+    done
+    test -f "$d/include/sqfs/predef.h" || fail "sqfs/predef.h not staged"
+    test -L "$d/lib/libsquashfs.so" || fail "libsquashfs.so link not staged"
+    test -e "$d/lib/libsquashfs.so.1" || fail "libsquashfs.so.1 not staged"
+    soname_check "$d/lib/libsquashfs.so.1" libsquashfs.so.1
+    for t in libz.so libzstd liblz4 liblzma; do
+        needed_check "$d/lib/libsquashfs.so.1" "$t"
+    done
+    not_needed_check "$d/lib/libsquashfs.so.1" liblzo2 libselinux
+    pc_check libsquashfs1 "$VERSION"
+}
+
+# squashfuse — the FUSE drivers squashfuse (high-level API) and squashfuse_ll
+# (low-level, multithreaded), with their man pages, linked against libfuse3
+# from this repo (configure finds fuse3 through pkgconf and selects the FUSE
+# 3.2 API). autotools. Both programs link squashfuse's own code statically
+# (upstream's convenience libraries), so only they and their man pages are
+# installed: not libsquashfuse, its headers or .pc files, which nothing uses.
+# Decompressors as for squashfs-tools-ng, LZO left out; no demo programs.
+# BSD-2-Clause.
+#
+# This is what mounts a squashfs image the way an AppImage does on Linux, as
+# a normal user (README, "Mounting a squashfs image as a user").
+build_squashfuse() {
+    comp "squashfuse [autotools cross]"
+    dep_check squashfuse libzstd.so liblz4.so libfuse3.so
+    fresh_dirs squashfuse
+    fetch squashfuse
+    autotools_configure --enable-shared --disable-static \
+        --disable-demo --without-lzo
+    make -C "$COMP_BUILD" $JOBS
+    make -C "$COMP_BUILD" install-binPROGRAMS install-man DESTDIR="$COMP_ROOT"
+    # automake makes install-binPROGRAMS depend on install-libLTLIBRARIES,
+    # which puts libsquashfuse and libsquashfuse_ll in place as well; the
+    # programs don't link them (checked below), so they are dropped.
+    rm -f "$COMP_ROOT$PREFIX"/lib/libsquashfuse*
+    stage squashfuse
+    local d="$DESTDIR$PREFIX" p l
+    ! ls "$d"/lib/libsquashfuse* >/dev/null 2>&1 || fail "libsquashfuse was staged"
+    for p in squashfuse squashfuse_ll; do
+        test -x "$d/bin/$p" || fail "/usr/bin/$p not staged"
+        test -s "$d/share/man/man1/$p.1" || fail "$p.1 not staged"
+        for l in libfuse3.so.4 libz.so libzstd liblz4 liblzma; do
+            needed_check "$d/bin/$p" "$l"
+        done
+        not_needed_check "$d/bin/$p" liblzo2 libsquashfuse libfuse.so.2
+    done
+}
+
 # =============================================================================
 # driver
 # =============================================================================
 # Add a component: pin it in sources.lock, write build_<name>() above (hyphens
 # in the name become underscores in the function), put its patches, if any, in
 # patches/<name>/ with a series file, and append <name> here in build order.
-COMPONENTS="wget lcms2"
+COMPONENTS="wget lcms2 zstd lz4 libfuse squashfs-tools-ng squashfuse"
 
 if [ $# -gt 0 ]; then
     for c in "$@"; do

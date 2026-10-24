@@ -1,8 +1,8 @@
 # Pinned upstream sources for nextbsd-gershwin-support.
 #
 # One line per component: <name> <version> <sha256> <url>
-# build-gershwin-support.sh downloads the URL, refuses it unless the SHA-256
-# matches, unpacks it and applies patches/<name>/*.patch in order. Bumping a
+# build-gershwin-support.sh downloads the URL (cached in .build/dl), refuses it unless the SHA-256
+# matches, unpacks it and applies patches/<name>/series in order. Bumping a
 # version is a deliberate change to this file (and to the component's notes in
 # README.md and NOTICE.md). Only upstream release tarballs: no FreeBSD
 # packages, ports or distfiles mirrors.

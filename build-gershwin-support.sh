@@ -3,31 +3,42 @@
 # build-gershwin-support.sh — cross-build driver for nextbsd-gershwin-support
 # =============================================================================
 #
-# Builds what only Gershwin uses (E24 D6, D8, D12) for ONE architecture into
-# $DESTDIR, from pinned upstream release tarballs listed in sources.lock, with
-# NextBSD's changes, if any, as patch series under patches/<name>/.
+# Builds what only Gershwin uses (E24 D6, D8, D12) for ONE architecture, from
+# pinned upstream release tarballs, into the /usr prefix with upstream sonames.
+# Follows the source repo conventions (nextbsd-userland wiki,
+# Source-Repo-Conventions; reference: nextbsd-xlibs' build-xlibs.sh).
 #
-# Each component keeps upstream's own build system, run in cross mode:
-#   - autotools: `configure --host=<triple>` with the toolchain clang and
-#     --sysroot, out of tree under .build/; configure checks that would run a
-#     test program get their FreeBSD answers as cache variables;
-#   - meson: the per-arch cross file in cross/<arch>.ini, layered on a paths
-#     file this script writes (meson_setup);
-#   - plain Makefiles: told the target OS and compiler on the command line.
-# Then only what NextBSD ships is staged, the way base ships it (stage_root).
+# For each component, in COMPONENTS order:
+#   1. fetch:   download the tarball named in sources.lock, refuse it unless
+#               its SHA-256 matches, unpack it under .build/src/;
+#   2. patch:   apply patches/<name>/series in order (each patch must state
+#               its Origin:);
+#   3. build:   upstream meson (cross/meson/<arch>.ini), autotools
+#               (cross/autotools/<arch>.site, --host=<triple>) or upstream's
+#               plain Makefile, out of tree where upstream allows, installed
+#               with DESTDIR into .build/<name>-root-<arch>/;
+#   4. stage:   check and tidy that install, then copy it into $SYSROOT (so
+#               later components find its headers, .pc files and libraries)
+#               and into $DESTDIR (the published artifact).
 #
-# Modelled on nextbsd-contrib's build-contrib.sh. Nothing here uses make.py,
-# the FreeBSD buildenv, FreeBSD packages or ports. Build tools come from the
-# toolchain image (pkgconf, never freedesktop's pkg-config: E24 D1).
+# Upstream build systems are used as they are, with NextBSD's options; nothing
+# is rewritten as a hand-made makefile. Nothing here uses FreeBSD packages, the
+# ports tree or ports tools, and nothing links against nextbsd-userland: the
+# NextBSD base (compat) sysroot is the only input besides sources.lock. Base
+# already has OpenSSL, zlib, xz, curl and ICU; they are never rebuilt here.
 #
 # EXECUTION CONTEXT (set up by CI before this runs)
-#   Inside the nextbsd-kernel-toolchain container, with compat's `continuous`
-#   base extracted into $SYSROOT. The image's pinned LLVM 19.1.7 tools live in
-#   $CROSS_BINDIR; meson, ninja, cmake, pkgconf and autotools are in PATH.
+#   Inside the nextbsd-kernel-toolchain container (pinned clang/lld 19.1.7 in
+#   $CROSS_BINDIR, meson, ninja, cmake, pkgconf, autotools), with compat's
+#   `continuous` base extracted into $SYSROOT. $SYSROOT is scratch: this script
+#   installs every component into its /usr as it goes (and refuses to replace
+#   a base file).
 #
 # USAGE
 #   ./build-gershwin-support.sh          every component, in COMPONENTS order
-#   ./build-gershwin-support.sh wget     one component by name
+#   ./build-gershwin-support.sh wget     named components only (their
+#                                        dependencies must already be in
+#                                        $SYSROOT)
 # =============================================================================
 
 set -euo pipefail
@@ -41,78 +52,144 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="$ROOT/.build"
-: "${SOURCES:=$ROOT/.sources}"      # tarball cache; CI keeps it between runs
+DL="$BUILD/dl"
+LOCK="$ROOT/sources.lock"
+PATCHES="$ROOT/patches"
+GS_CROSS="$ROOT/cross"
+
+# Install prefix (E24 Q7): /usr, never /usr/local. .pc files go where base
+# keeps them under /usr, /usr/libdata/pkgconfig, whatever the upstream default.
+PREFIX=/usr
+PC_DIR=/usr/libdata/pkgconfig
+# The only places under /usr a component may install into.
+ALLOWED_DIRS="usr/bin usr/sbin usr/lib usr/libexec usr/include usr/libdata/pkgconfig usr/share/man"
 
 case "$T" in
     amd64) CROSS_TRIPLE=x86_64-unknown-freebsd ;;
     arm64) CROSS_TRIPLE=aarch64-unknown-freebsd ;;
-    *)     CROSS_TRIPLE="${TA}-unknown-freebsd" ;;
+    *)     echo "FAIL: unsupported T=$T (amd64 / arm64)" >&2; exit 1 ;;
 esac
-CROSS_CC="$CROSS_BINDIR/clang --target=$CROSS_TRIPLE --ld-path=$CROSS_BINDIR/ld.lld"
 BUILD_TRIPLE="$(uname -m)-pc-linux-gnu"
 JOBS=-j"$(nproc 2>/dev/null || echo 2)"
 
-export SYSROOT DESTDIR CROSS_BINDIR
+SYSROOT="$(cd "$SYSROOT" && pwd)"
+export SYSROOT DESTDIR CROSS_BINDIR GS_CROSS
 
-# ---- pkgconf -----------------------------------------------------------------
-# Only the sysroot's .pc files, with the sysroot prefixed to their -I/-L
-# paths, so nothing from the build host leaks in. Base keeps its .pc files in
-# /usr/libdata/pkgconfig; the X11 directories are there for the repos that
-# stage into /usr/X11 (nextbsd-xlibs), once a component here needs them.
-# Libraries built earlier in this repo live under $DESTDIR, not the sysroot,
-# so their flags are passed to the later component directly (see dep_check).
-PC_DIRS=""
-for d in usr/libdata/pkgconfig usr/X11/libdata/pkgconfig usr/X11/lib/pkgconfig; do
-    [ -d "$SYSROOT/$d" ] && PC_DIRS="${PC_DIRS:+$PC_DIRS:}$SYSROOT/$d"
-done
+# pkgconf (ISC, never freedesktop's pkg-config) for this script's own checks
+# and for plain-Makefile builds: the sysroot's .pc directories only, -I/-L
+# prefixed with the sysroot. meson and autotools set the same from the cross
+# files.
 export PKG_CONFIG=pkgconf
-export PKG_CONFIG_LIBDIR="$PC_DIRS"
+export PKG_CONFIG_LIBDIR="$SYSROOT$PC_DIR:$SYSROOT/usr/X11/lib/pkgconfig"
 export PKG_CONFIG_SYSROOT_DIR="$SYSROOT"
 unset PKG_CONFIG_PATH
+
+# Files this repo has staged into $SYSROOT, so a re-run may replace its own
+# files but never a base file.
+OWNED="$BUILD/owned-$T.list"
 
 # ---- helpers -----------------------------------------------------------------
 comp() { echo; echo "==> [$T/$TA] $*"; }
 note() { echo "    - $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-# The toolchain image ships the pinned llvm-ar/llvm-ranlib/llvm-strip in
-# $CROSS_BINDIR (and /usr/bin/<tool>-19).
-llvm_tool() {
-    local t
-    for t in "$CROSS_BINDIR/$1" "$(command -v "$1-19" 2>/dev/null)" "$(command -v "$1" 2>/dev/null)"; do
-        [ -n "$t" ] && [ -x "$t" ] && { echo "$t"; return 0; }
-    done
-    fail "$1 not found (looked in $CROSS_BINDIR and PATH)"
+READELF="$CROSS_BINDIR/llvm-readelf"
+STRIP="$CROSS_BINDIR/llvm-strip"
+
+# lock_field <name> <version|sha256|url>: a component's pin from sources.lock.
+lock_field() {
+    local name="$1" field="$2" col
+    case "$field" in
+        version) col=2 ;;
+        sha256)  col=3 ;;
+        url)     col=4 ;;
+        *)       fail "lock_field: unknown field $field" ;;
+    esac
+    awk -v n="$name" -v c="$col" '$1 == n && $1 !~ /^#/ { print $c; found=1 } END { exit !found }' "$LOCK" \
+        || fail "$name is not pinned in sources.lock"
 }
 
-# Assert a staged binary links a given library (a cross `readelf -d` check; we
+# Assert a staged object links a given library (a cross `readelf -d` check; we
 # cannot exec target binaries on the runner).
 needed_check() {
     local obj="$1" want="$2"
-    local readelf="$CROSS_BINDIR/readelf"
-    [ -x "$readelf" ] || readelf="$CROSS_BINDIR/llvm-readelf"
-    [ -x "$readelf" ] || readelf="$(command -v llvm-readelf-19 2>/dev/null || true)"
-    if [ ! -x "$readelf" ]; then
-        note "skip DT_NEEDED check ($want): no readelf found"
-        return 0
-    fi
-    "$readelf" -d "$obj" 2>/dev/null | grep -q "NEEDED.*$want" \
+    "$READELF" -d "$obj" 2>/dev/null | grep -q "NEEDED.*\[$want" \
         || fail "$obj missing DT_NEEDED $want"
     note "DT_NEEDED ok: $(basename "$obj") -> $want"
 }
 
-# The opposite: fail if a staged binary links a library it must not (the
+# The opposite: fail if a staged object links any of the given libraries (the
 # optional dependencies a minimal build leaves out).
 not_needed_check() {
-    local obj="$1" lib readelf="$CROSS_BINDIR/llvm-readelf"
+    local obj="$1" lib
     shift
-    [ -x "$readelf" ] || { note "skip DT_NEEDED exclusions: no readelf"; return 0; }
     for lib in "$@"; do
-        if "$readelf" -d "$obj" 2>/dev/null | grep -q "NEEDED.*\[$lib"; then
+        if "$READELF" -d "$obj" 2>/dev/null | grep -q "NEEDED.*\[$lib"; then
             fail "$obj links $lib, which this build leaves out"
         fi
     done
     note "DT_NEEDED ok: $(basename "$obj") links none of: $*"
+}
+
+# Assert a staged shared library carries the upstream soname.
+soname_check() {
+    local lib="$1" want="$2"
+    "$READELF" -d "$lib" 2>/dev/null | grep -q "SONAME.*\[$want\]" \
+        || fail "$lib does not have SONAME $want"
+    note "SONAME ok: $want"
+}
+
+# fetch <name>: download (cached in .build/dl), verify and unpack the pinned
+# tarball, apply the patch series. Sets SRC_DIR and VERSION. Every unpacked
+# file then gets one mtime, so automake's rebuild rules never fire because a
+# patch made a Makefile.am or configure.ac look newer than its outputs (a patch
+# that changes an autotools input must change the generated file too).
+fetch() {
+    local name="$1" url sha file got
+    VERSION=$(lock_field "$name" version)
+    url=$(lock_field "$name" url)
+    sha=$(lock_field "$name" sha256)
+    file="$DL/$(basename "$url")"
+    mkdir -p "$DL"
+    if [ ! -f "$file" ]; then
+        note "fetch $url"
+        curl -fsSL --retry 3 -o "$file.part" "$url"
+        mv "$file.part" "$file"
+    fi
+    got=$(sha256sum "$file" | cut -d' ' -f1)
+    [ "$got" = "$sha" ] || { rm -f "$file"; fail "$name: SHA-256 mismatch for $(basename "$file") (got $got, sources.lock has $sha)"; }
+    note "$name $VERSION, sha256 ok"
+    SRC_DIR="$BUILD/src/$name-$VERSION"
+    rm -rf "$SRC_DIR"
+    mkdir -p "$SRC_DIR"
+    tar -xf "$file" -C "$SRC_DIR" --strip-components=1
+    apply_patches "$name"
+    find "$SRC_DIR" -exec touch -h -r "$file" {} +
+}
+
+# apply_patches <name>: patches/<name>/series lists the patches in order, one
+# per line (# comments allowed). Every *.patch in the directory must be listed,
+# and every patch must say where it came from in an `Origin:` header line
+# (DEP-3 style: upstream commit or MR, nextbsd-ports, a FreeBSD port file used
+# as a reference, or "NextBSD" for our own).
+apply_patches() {
+    local name="$1" dir="$PATCHES/$1" p n=0
+    [ -d "$dir" ] || { note "no patches"; return 0; }
+    [ -f "$dir/series" ] || fail "patches/$name has no series file"
+    for p in "$dir"/*.patch; do
+        [ -e "$p" ] || continue
+        grep -qx "$(basename "$p")" "$dir/series" || fail "patches/$name/$(basename "$p") is not listed in series"
+    done
+    while read -r p; do
+        case "$p" in ''|'#'*) continue ;; esac
+        [ -f "$dir/$p" ] || fail "patches/$name/series lists missing $p"
+        grep -q '^Origin:' "$dir/$p" || fail "patches/$name/$p has no Origin: line"
+        patch -d "$SRC_DIR" -p1 --forward --batch --quiet --no-backup-if-mismatch < "$dir/$p" \
+            || fail "patches/$name/$p does not apply"
+        note "patch $p"
+        n=$((n + 1))
+    done < "$dir/series"
+    note "$n patch(es) applied"
 }
 
 # Fresh out-of-tree build and install-root directories for a component.
@@ -124,204 +201,197 @@ fresh_dirs() {
     mkdir -p "$COMP_BUILD" "$COMP_ROOT"
 }
 
-# ---- sources -----------------------------------------------------------------
-# Look a component up in sources.lock: sets SRC_VERSION, SRC_SHA256, SRC_URL.
-lock_entry() {
-    local name="$1" line
-    line=$(awk -v n="$name" '$1 == n && $0 !~ /^[[:space:]]*#/ { print; exit }' "$ROOT/sources.lock")
-    [ -n "$line" ] || fail "$name is not in sources.lock"
-    read -r _ SRC_VERSION SRC_SHA256 SRC_URL <<<"$line"
-    [ -n "$SRC_URL" ] || fail "sources.lock: $name needs <version> <sha256> <url>"
+# meson_build [meson -D options...]: configure, build and install $SRC_DIR into
+# $COMP_ROOT with the arch's cross file. The first cross file is generated here
+# and carries the paths of this run; the second is the checked-in one.
+meson_build() {
+    local paths="$BUILD/cross/paths-$T.ini"
+    mkdir -p "$BUILD/cross"
+    cat > "$paths" <<EOF
+[constants]
+sysroot = '$SYSROOT'
+llvm_bindir = '$CROSS_BINDIR'
+EOF
+    meson setup "$COMP_BUILD" "$SRC_DIR" \
+        --cross-file "$paths" --cross-file "$GS_CROSS/meson/$T.ini" \
+        --prefix="$PREFIX" --libdir=lib --includedir=include \
+        --mandir=share/man --sysconfdir=/etc \
+        --buildtype=release -Ddefault_library=shared --wrap-mode=nodownload \
+        "$@"
+    meson compile -C "$COMP_BUILD"
+    DESTDIR="$COMP_ROOT" meson install -C "$COMP_BUILD" --no-rebuild
 }
 
-# Download (or reuse from $SOURCES) a component's pinned tarball, refuse it
-# unless its SHA-256 matches sources.lock, unpack it into a fresh
-# $BUILD/<name>-src-$T and apply patches/<name>/*.patch in name order with
-# -p1. Sets SRC_DIR. Every file then gets one mtime, so automake's rebuild
-# rules never fire because a patch (or the tarball's own order) made a
-# Makefile.am or configure.ac look newer than what was generated from it.
-# A patch that changes an autotools input must change the generated file too.
-fetch_src() {
-    local name="$1" tarball p n=0
-    lock_entry "$name"
-    mkdir -p "$SOURCES"
-    tarball="$SOURCES/$(basename "$SRC_URL")"
-    if [ ! -f "$tarball" ] || ! echo "$SRC_SHA256  $tarball" | sha256sum -c --status -; then
-        note "fetch $SRC_URL"
-        curl -fsSL --retry 3 -o "$tarball.part" "$SRC_URL"
-        mv "$tarball.part" "$tarball"
-    fi
-    echo "$SRC_SHA256  $tarball" | sha256sum -c --status - \
-        || fail "$name: $(basename "$tarball") does not match the SHA-256 in sources.lock"
-    note "$name $SRC_VERSION ($(basename "$tarball"), sha256 ok)"
-    SRC_DIR="$BUILD/$name-src-$T"
-    rm -rf "$SRC_DIR"
-    mkdir -p "$SRC_DIR"
-    tar -xf "$tarball" -C "$SRC_DIR" --strip-components=1
-    if [ -d "$ROOT/patches/$name" ]; then
-        for p in "$ROOT/patches/$name"/*.patch; do
-            [ -e "$p" ] || continue
-            patch -d "$SRC_DIR" -p1 --batch --forward --no-backup-if-mismatch -s < "$p" \
-                || fail "$name: $(basename "$p") does not apply"
-            n=$((n + 1))
+# autotools_configure [configure options...]: upstream configure in --host mode
+# with the arch's CONFIG_SITE, out of tree in $COMP_BUILD.
+autotools_configure() {
+    (
+        cd "$COMP_BUILD"
+        CONFIG_SITE="$GS_CROSS/autotools/$T.site" \
+        "$SRC_DIR/configure" \
+            --build="$BUILD_TRIPLE" --host="$CROSS_TRIPLE" \
+            --with-sysroot="$SYSROOT" \
+            --prefix="$PREFIX" --libdir="$PREFIX/lib" \
+            --sysconfdir=/etc --mandir="$PREFIX/share/man" \
+            --disable-dependency-tracking --disable-silent-rules \
+            "$@"
+    )
+}
+
+# autotools_build [configure options...]: configure; make; make install into
+# $COMP_ROOT. For components whose full install is what NextBSD ships.
+autotools_build() {
+    autotools_configure --enable-shared --disable-static "$@"
+    make -C "$COMP_BUILD" $JOBS
+    make -C "$COMP_BUILD" install DESTDIR="$COMP_ROOT"
+}
+
+# stage <name>: tidy and check $COMP_ROOT, then copy it into $SYSROOT (for the
+# components after this one) and $DESTDIR (the artifact).
+#   - everything must be under ALLOWED_DIRS (so /usr/local, /etc, info and
+#     locale files are refused);
+#   - libtool .la files, static archives and docs are dropped;
+#   - .pc files from lib/pkgconfig or share/pkgconfig move to $PC_DIR, and no
+#     .pc file may name /usr/local or a build-host path;
+#   - shared objects and programs are stripped with the target strip;
+#     programs are 0555, everything else 0444;
+#   - no staged file may replace a base file in $SYSROOT.
+stage() {
+    local name="$1" r="$COMP_ROOT" stray f d rel allowed
+    [ -d "$r$PREFIX" ] || fail "$name installed nothing under $PREFIX"
+    find "$r" \( -name '*.la' -o -name '*.a' \) -delete
+    rm -rf "$r$PREFIX/share/doc"
+    for d in "$r$PREFIX/lib/pkgconfig" "$r$PREFIX/share/pkgconfig"; do
+        [ -d "$d" ] || continue
+        mkdir -p "$r$PC_DIR"
+        mv "$d"/*.pc "$r$PC_DIR/"
+        rmdir "$d"
+    done
+    stray=""
+    while IFS= read -r rel; do
+        allowed=no
+        for d in $ALLOWED_DIRS; do
+            case "$rel" in "$d"/*) allowed=yes; break ;; esac
         done
-    fi
-    note "patches applied: $n"
-    find "$SRC_DIR" -exec touch -h -r "$tarball" {} +
+        [ "$allowed" = yes ] || stray="$stray /$rel"
+    done < <(cd "$r" && find . ! -type d | sed 's#^\./##')
+    [ -z "$stray" ] || fail "$name installed outside $ALLOWED_DIRS:$stray"
+    for f in "$r$PC_DIR"/*.pc; do
+        [ -e "$f" ] || continue
+        grep -q "^prefix=$PREFIX\$" "$f" || fail "$(basename "$f"): prefix is not $PREFIX"
+        if grep -n -F -e /usr/local -e "$ROOT" -e "$SYSROOT" -e "$BUILD" "$f"; then
+            fail "$(basename "$f") names /usr/local or a build-host path"
+        fi
+    done
+    find "$r" -type f -name '*.so*' -exec "$STRIP" --strip-unneeded {} +
+    find "$r" -type d -exec chmod 0755 {} +
+    find "$r" -type f -exec chmod 0444 {} +
+    for d in bin sbin libexec; do
+        [ -d "$r$PREFIX/$d" ] || continue
+        find "$r$PREFIX/$d" -type f -exec "$STRIP" {} +
+        find "$r$PREFIX/$d" -type f -exec chmod 0555 {} +
+    done
+    find "$r" -type d -empty -delete
+    touch "$OWNED"
+    while IFS= read -r rel; do
+        if [ -e "$SYSROOT/$rel" ] || [ -L "$SYSROOT/$rel" ]; then
+            grep -qxF "$rel" "$OWNED" || fail "$name would replace base file /$rel"
+        fi
+        echo "$rel" >> "$OWNED"
+    done < <(cd "$r" && find . ! -type d | sed 's#^\./##')
+    (cd "$r" && tar -cf - .) | (cd "$SYSROOT" && tar -xf -)
+    (cd "$r" && tar -cf - .) | (cd "$DESTDIR" && tar -xf -)
+    note "staged $(cd "$r" && find . ! -type d | wc -l) files"
 }
 
-# Fail early when a library a later component links has not been staged.
-# Libraries built here are staged into $DESTDIR, and a later component
-# compiles against $DESTDIR/usr/include and links $DESTDIR/usr/lib next to the
-# sysroot, so COMPONENTS order matters.
+# pc_check <module> [version]: the staged .pc resolves through pkgconf the way
+# later components will see it (and, if given, at that version).
+pc_check() {
+    local mod="$1" want="${2:-}" got
+    got=$(pkgconf --modversion "$mod") || fail "pkgconf cannot resolve $mod"
+    [ -z "$want" ] || [ "$got" = "$want" ] || fail "$mod.pc is version $got, expected $want"
+    note "pkgconf ok: $mod $got"
+}
+
+# dep_check <component> <lib>...: fail early when a library a later component
+# links has not been staged into $SYSROOT by an earlier one (COMPONENTS order).
 dep_check() {
-    local comp="$1"; shift
-    local lib
+    local comp="$1" lib
+    shift
     for lib in "$@"; do
-        [ -e "$DESTDIR/usr/lib/$lib" ] \
-            || fail "$comp needs $DESTDIR/usr/lib/$lib; build its component first (COMPONENTS order)"
+        grep -qxF "usr/lib/$lib" "$OWNED" 2>/dev/null \
+            || fail "$comp needs /usr/lib/$lib from this repo; build its component first (COMPONENTS order)"
     done
 }
 
-# Write the meson paths file for this arch (the constants cross/<arch>.ini
-# uses) and run `meson setup` with both. Extra arguments go to meson setup.
-meson_setup() {
-    local builddir="$1" srcdir="$2" paths pcl="" d
-    shift 2
-    command -v meson >/dev/null || fail "meson not found (the toolchain image provides it)"
-    paths="$BUILD/paths-$T.ini"
-    IFS=: read -ra dirs <<<"$PC_DIRS"
-    for d in "${dirs[@]}"; do pcl="${pcl:+$pcl, }'$d'"; done
-    cat > "$paths" <<EOF
-[constants]
-bindir = '$CROSS_BINDIR'
-sysroot = '$SYSROOT'
-pc_libdir = [$pcl]
-EOF
-    meson setup "$builddir" "$srcdir" \
-        --cross-file "$paths" --cross-file "$ROOT/cross/$T.ini" \
-        --prefix=/usr --libdir=lib --includedir=include \
-        --mandir=share/man --sysconfdir=/etc \
-        --buildtype=release --wrap-mode=nodownload \
-        "$@"
-}
-
-# Copy a component's install root into $DESTDIR the way base ships libraries
-# and programs: no static or libtool archives, .pc files in
-# /usr/libdata/pkgconfig, shared objects and programs stripped with the target
-# strip, programs 0555 and everything else 0444.
-stage_root() {
-    local root="$1" strip
-    strip=$(llvm_tool llvm-strip)
-    find "$root" \( -name '*.la' -o -name '*.a' \) -delete
-    # meson and libtool put .pc files under lib/; base keeps them in libdata.
-    if [ -d "$root/usr/lib/pkgconfig" ]; then
-        mkdir -p "$root/usr/libdata/pkgconfig"
-        mv "$root/usr/lib/pkgconfig/"*.pc "$root/usr/libdata/pkgconfig/"
-        rmdir "$root/usr/lib/pkgconfig"
-    fi
-    find "$root" -type f -name '*.so.*' -exec "$strip" --strip-unneeded {} +
-    find "$root" -type d -exec chmod 0755 {} +
-    find "$root" -type f -exec chmod 0444 {} +
-    if [ -d "$root/usr/bin" ]; then
-        find "$root/usr/bin" -type f -exec "$strip" {} +
-        find "$root/usr/bin" -type f -exec chmod 0555 {} +
-    fi
-    (cd "$root" && tar -cf - .) | (cd "$DESTDIR" && tar -xf -)
-    return 0
-}
-
 # =============================================================================
-# wget (nextbsd/nextbsd-gershwin-support#1, E24 D8)
+# Components, in build order.
 # =============================================================================
-# GNU wget, minimal: TLS from base OpenSSL, compression from base zlib, and
-# nothing else. No NLS, no libpsl (cookie public-suffix checks), no libidn2
-# (IDN/IRI), no PCRE/PCRE2 (--accept-regex keeps POSIX regex), no c-ares,
-# metalink, libuuid or libproxy. Ships /usr/bin/wget and wget.1; no
-# /etc/wgetrc (wget runs without one) and no info manual (base has no info).
-# GPL-3.0-or-later, which is why it lives in this package and not in the
-# default base.
+
+# wget (nextbsd/nextbsd-gershwin-support#1, E24 D8) — GNU wget, minimal: TLS
+# from base OpenSSL, compression from base zlib, and nothing else. No NLS, no
+# libpsl (cookie public-suffix checks), no libidn2 (IDN/IRI), no PCRE/PCRE2
+# (--accept-regex keeps POSIX regex), no c-ares, metalink, libuuid or libproxy.
+# autotools. Only src/ and the man page are built and installed: upstream's
+# full `make install` would also put /etc/wgetrc (wget runs without one) and
+# the info manual (base has no info) in place. GPL-3.0-or-later, which is why
+# it lives in this optional package and not in the default base.
 build_wget() {
-    comp "wget [autoconf cross]"
+    comp "wget [autotools cross]"
     fresh_dirs wget
-    fetch_src wget
-    local ar ranlib strip
-    ar=$(llvm_tool llvm-ar); ranlib=$(llvm_tool llvm-ranlib); strip=$(llvm_tool llvm-strip)
-    (
-        cd "$COMP_BUILD"
-        # Nothing to pre-seed: the configure checks that would run a test
-        # program fall back to gnulib's cross guesses.
-        CC="$CROSS_CC --sysroot=$SYSROOT" \
-        CFLAGS="-O2 -pipe" \
-        CPPFLAGS="-I$SYSROOT/usr/include" \
-        LDFLAGS="-L$SYSROOT/usr/lib" \
-        AR="$ar" RANLIB="$ranlib" STRIP="$strip" \
-        "$SRC_DIR/configure" \
-            --build="$BUILD_TRIPLE" --host="$CROSS_TRIPLE" \
-            --prefix=/usr --sysconfdir=/etc --mandir=/usr/share/man \
-            --with-ssl=openssl --with-zlib \
-            --without-libpsl --disable-iri --disable-pcre2 --disable-pcre \
-            --disable-nls --disable-rpath --disable-xattr \
-            --without-metalink --without-cares --without-libuuid \
-            --disable-libproxy \
-            --disable-dependency-tracking
-        make $JOBS -C lib
-        make $JOBS -C src wget
-        make -C doc wget.1
-        mkdir -p "$COMP_ROOT/usr/bin" "$COMP_ROOT/usr/share/man/man1"
-        install -m 0555 src/wget "$COMP_ROOT/usr/bin/wget"
-        install -m 0444 doc/wget.1 "$COMP_ROOT/usr/share/man/man1/wget.1"
-    )
-    stage_root "$COMP_ROOT"
-    test -x "$DESTDIR/usr/bin/wget" || fail "/usr/bin/wget was not staged"
-    test -s "$DESTDIR/usr/share/man/man1/wget.1" || fail "wget.1 was not staged"
-    needed_check "$DESTDIR/usr/bin/wget" "libssl"
-    needed_check "$DESTDIR/usr/bin/wget" "libcrypto"
-    needed_check "$DESTDIR/usr/bin/wget" "libz"
-    not_needed_check "$DESTDIR/usr/bin/wget" libpsl libidn2 libpcre libunistring libintl libiconv libcares libmetalink libuuid libgnutls
-    [ -e "$DESTDIR/etc" ] && fail "wget staged /etc; this package ships no configuration"
-    return 0
+    fetch wget
+    autotools_configure \
+        --with-ssl=openssl --with-zlib \
+        --without-libpsl --disable-iri --disable-pcre2 --disable-pcre \
+        --disable-nls --disable-rpath --disable-xattr \
+        --without-metalink --without-cares --without-libuuid \
+        --disable-libproxy
+    make -C "$COMP_BUILD/lib" $JOBS
+    make -C "$COMP_BUILD/src" $JOBS
+    make -C "$COMP_BUILD/src" install DESTDIR="$COMP_ROOT"
+    make -C "$COMP_BUILD/doc" install.man DESTDIR="$COMP_ROOT"
+    stage wget
+    local d="$DESTDIR$PREFIX"
+    test -x "$d/bin/wget" || fail "/usr/bin/wget not staged"
+    test -s "$d/share/man/man1/wget.1" || fail "wget.1 not staged"
+    needed_check "$d/bin/wget" libssl
+    needed_check "$d/bin/wget" libcrypto
+    needed_check "$d/bin/wget" libz
+    not_needed_check "$d/bin/wget" libpsl libidn2 libpcre libunistring libintl libiconv \
+        libcares libmetalink libuuid libgnutls libproxy
 }
 
-# =============================================================================
-# lcms2 (nextbsd/nextbsd-gershwin-support#1) — Little CMS
-# =============================================================================
-# The library Gershwin's Color pane links: liblcms2.so.2 (upstream soname),
-# lcms2.h, lcms2_plugin.h and lcms2.pc, built with upstream's meson build and
-# the repo's cross file. The library only: no utilities (jpgicc and tificc
-# would need libjpeg and libtiff; nothing in Gershwin runs the others) and not
-# the fast-float or threaded plugins, which are GPL-3.0 where the library is
-# MIT.
+# lcms2 (nextbsd/nextbsd-gershwin-support#1) — Little CMS, the library
+# Gershwin's Color pane links: liblcms2.so.2 (upstream soname), lcms2.h,
+# lcms2_plugin.h and lcms2.pc. meson. The library only: no utilities (jpgicc
+# and tificc would need libjpeg and libtiff; nothing in Gershwin runs the
+# others) and not the fast-float or threaded plugins, which are GPL-3.0 where
+# the library is MIT. lcms2.pc says 2.19: upstream's project version omits the
+# .1 (configure says 2.19 too).
 build_lcms2() {
     comp "lcms2 [meson cross]"
     fresh_dirs lcms2
-    fetch_src lcms2
-    meson_setup "$COMP_BUILD/build" "$SRC_DIR" \
+    fetch lcms2
+    meson_build \
         -Dutils=false -Dtests=disabled -Djpeg=disabled -Dtiff=disabled \
         -Dfastfloat=false -Dthreaded=false -Dversionedlibs=true
-    meson compile -C "$COMP_BUILD/build"
-    meson install -C "$COMP_BUILD/build" --destdir "$COMP_ROOT"
-    stage_root "$COMP_ROOT"
-    test -f "$DESTDIR/usr/include/lcms2.h" || fail "lcms2.h was not staged"
-    test -f "$DESTDIR/usr/include/lcms2_plugin.h" || fail "lcms2_plugin.h was not staged"
-    test -f "$DESTDIR/usr/libdata/pkgconfig/lcms2.pc" || fail "lcms2.pc was not staged"
-    test -e "$DESTDIR/usr/lib/liblcms2.so.2" || fail "liblcms2.so.2 was not staged"
-    test -L "$DESTDIR/usr/lib/liblcms2.so" || fail "liblcms2.so link was not staged"
-    local readelf soname
-    readelf=$(llvm_tool llvm-readelf)
-    soname=$("$readelf" -d "$DESTDIR/usr/lib/liblcms2.so.2" | sed -n 's/.*SONAME.*\[\(.*\)\]/\1/p')
-    [ "$soname" = liblcms2.so.2 ] || fail "liblcms2 soname is '$soname', upstream's is liblcms2.so.2"
-    note "soname: $soname"
-    needed_check "$DESTDIR/usr/lib/liblcms2.so.2" "libm"
-    return 0
+    stage lcms2
+    local d="$DESTDIR$PREFIX"
+    test -f "$d/include/lcms2.h" || fail "lcms2.h not staged"
+    test -f "$d/include/lcms2_plugin.h" || fail "lcms2_plugin.h not staged"
+    test -L "$d/lib/liblcms2.so" || fail "liblcms2.so link not staged"
+    test -e "$d/lib/liblcms2.so.2" || fail "liblcms2.so.2 not staged"
+    soname_check "$d/lib/liblcms2.so.2" liblcms2.so.2
+    needed_check "$d/lib/liblcms2.so.2" libm
+    pc_check lcms2 2.19
 }
 
 # =============================================================================
 # driver
 # =============================================================================
-# Add a component: a pinned line in sources.lock, build_<name>() above
-# (hyphens in the name become underscores in the function), and <name> here,
-# after anything it links that this repo builds.
+# Add a component: pin it in sources.lock, write build_<name>() above (hyphens
+# in the name become underscores in the function), put its patches, if any, in
+# patches/<name>/ with a series file, and append <name> here in build order.
 COMPONENTS="wget lcms2"
 
 if [ $# -gt 0 ]; then
@@ -334,13 +404,20 @@ if [ $# -gt 0 ]; then
     COMPONENTS="$*"
 fi
 
-echo "nextbsd-gershwin-support: building [$COMPONENTS] for $T/$TA into $DESTDIR"
-echo "pkgconf search path: ${PKG_CONFIG_LIBDIR:-<none>}"
+for t in clang llvm-readelf llvm-strip; do
+    [ -x "$CROSS_BINDIR/$t" ] || fail "$CROSS_BINDIR/$t not found (the toolchain image provides it)"
+done
+
+echo "nextbsd-gershwin-support: building [$COMPONENTS] for $T/$TA into $DESTDIR$PREFIX"
+echo "pkgconf searches only: $PKG_CONFIG_LIBDIR"
 mkdir -p "$DESTDIR" "$BUILD"
+# A full run starts from a fresh base sysroot, so it starts a fresh list of
+# what this repo owns there; a run of named components keeps the list.
+[ $# -gt 0 ] || : > "$OWNED"
 for c in $COMPONENTS; do
     "build_$(printf '%s' "$c" | tr - _)"
 done
 
 echo
 echo "==> staged into $DESTDIR:"
-( cd "$DESTDIR" && find . \( -type f -o -type l \) | sort | sed 's#^\.##' )
+( cd "$DESTDIR" && find . ! -type d | sort | sed 's#^\.##' )

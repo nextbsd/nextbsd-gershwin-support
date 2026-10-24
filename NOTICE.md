@@ -8,7 +8,7 @@ provenance and does not relicense anything. NextBSD changes, if any, are the
 patch files under `patches/<name>/`, under the licence of the file they patch.
 
 The top-level **`LICENSE` (BSD 2-Clause)** covers only what this repo authors:
-`build-gershwin-support.sh`, `sources.lock`, `cross/`, `.github/workflows/`,
+`build-gershwin-support.sh`, `sources.lock`, `cross/`, the `series` files, `.github/workflows/`,
 this `NOTICE.md` and `README.md`.
 
 | Component | Upstream | Version | Licence |

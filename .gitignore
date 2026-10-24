@@ -1,0 +1,4 @@
+# Out-of-tree build and staging scratch from build-gershwin-support.sh.
+.build/
+# Downloaded upstream tarballs (verified against sources.lock).
+.sources/

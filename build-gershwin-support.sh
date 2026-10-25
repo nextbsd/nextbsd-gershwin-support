@@ -31,7 +31,7 @@
 # curl and ICU; they are never rebuilt here.
 #
 # EXECUTION CONTEXT (set up by CI before this runs)
-#   Inside the nextbsd-kernel-toolchain container (pinned clang/lld 19.1.7 in
+#   Inside the nextbsd-toolchain container (pinned clang/lld 19.1.7 in
 #   $CROSS_BINDIR, meson, ninja, cmake, pkgconf, autotools), with compat's
 #   `continuous` base, then nextbsd-displayserver-support's (/usr) and
 #   nextbsd-xlibs' (/usr/X11) `continuous` artifacts extracted into $SYSROOT. $SYSROOT is scratch: this script installs every

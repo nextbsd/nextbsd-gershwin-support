@@ -23,8 +23,9 @@ A component belongs in this repo when all of these hold:
    FreeBSD packages, ports or ports tools.
 3. **It links only against what is built before it**: the NextBSD base
    (OpenSSL 3.5, zlib, xz, curl and ICU are already there and are never
-   rebuilt here), the E23/E24 repos it is ordered after (nextbsd-xlibs for
-   the X libraries), and libraries built earlier in this repo.
+   rebuilt here), the E23/E24/E25 repos it is ordered after
+   (nextbsd-displayserver-support for libxkbcommon, nextbsd-xlibs for the X
+   libraries), and libraries built earlier in this repo.
 4. **It installs under `/usr`**, with upstream's sonames, its `.pc` files in
    `/usr/libdata/pkgconfig` as base does, and no static or libtool archives.
    Never `/usr/local` (E24 Q7). A component that needs X goes under `/usr/X11`
@@ -45,7 +46,7 @@ A component belongs in this repo when all of these hold:
 | `libfuse` | libfuse 3.18.3, library only, with patch 0001 for user mounts (below) | `/usr/lib/libfuse3.so.4`, `/usr/include/fuse3/`, `fuse3.pc` | nextbsd/nextbsd-gershwin-support#3 |
 | `squashfs-tools-ng` | squashfs-tools-ng 1.3.2: libsquashfs (AppImage icons and `.desktop` files without mounting) and the tools; gzip, xz, lz4, zstd and bzip2, no LZO | `/usr/lib/libsquashfs.so.1`, `/usr/include/sqfs/`, `libsquashfs1.pc`; `gensquashfs`, `rdsquashfs`, `sqfs2tar`, `sqfsdiff`, `tar2sqfs` and their man pages | nextbsd/nextbsd-gershwin-support#3 |
 | `squashfuse` | squashfuse 0.6.5 on libfuse3, the same decompressors | `/usr/bin/squashfuse`, `/usr/bin/squashfuse_ll` and their man pages | nextbsd/nextbsd-gershwin-support#3 |
-| `xdotool` | xdotool 4.20260303.1 (Gershwin's Whisper types text into windows with it), on libX11, libXtst, libXinerama and libxkbcommon from nextbsd-xlibs. An X client, so under `/usr/X11` | `/usr/X11/bin/xdotool`, `/usr/X11/lib/libxdo.so.4`, `/usr/X11/include/xdo.h`, `/usr/X11/lib/pkgconfig/libxdo.pc`, `xdotool.1` | nextbsd/nextbsd-gershwin-support#2 |
+| `xdotool` | xdotool 4.20260303.1 (Gershwin's Whisper types text into windows with it), on libX11, libXtst and libXinerama from nextbsd-xlibs and libxkbcommon from nextbsd-displayserver-support. An X client, so under `/usr/X11` | `/usr/X11/bin/xdotool`, `/usr/X11/lib/libxdo.so.4`, `/usr/X11/include/xdo.h`, `/usr/X11/lib/pkgconfig/libxdo.pc`, `xdotool.1` | nextbsd/nextbsd-gershwin-support#2 |
 
 Licences are per component; see `NOTICE.md`. The top-level `LICENSE` (BSD-2)
 covers only the harness in this repo.
@@ -114,15 +115,20 @@ builds, install roots and the generated cross file) is scratch and ignored.
 
 `build-gershwin-support.sh` runs inside the `nextbsd-kernel-toolchain`
 container (clang/lld 19.1.7 and the LLVM binutils, meson, ninja, cmake,
-pkgconf, autotools) with compat's `continuous` base and nextbsd-xlibs'
-`continuous` artifact (`/usr/X11`) staged as the cross sysroot. The xlibs
-files are only built against: the artifact never carries them. It needs:
+pkgconf, autotools) with compat's `continuous` base, then
+nextbsd-displayserver-support's (`/usr`) and nextbsd-xlibs' (`/usr/X11`)
+`continuous` artifacts, staged as the cross sysroot in that order. Their
+files are only built against: the artifact never carries them. Until
+nextbsd-xlibs#9 drops it, xlibs still carries a `/usr/X11` copy of
+libxkbcommon (same version); the build checks that pkgconf resolves
+`xkbcommon.pc` in `/usr/libdata/pkgconfig` and logs where each of xdotool's
+`.pc` files came from. It needs:
 
 | Variable | Meaning |
 |---|---|
 | `T` | target: `amd64` or `arm64` |
 | `TA` | FreeBSD `TARGET_ARCH`: `amd64` or `aarch64` |
-| `SYSROOT` | the staged NextBSD base with nextbsd-xlibs in `/usr/X11` (scratch: components are installed into it) |
+| `SYSROOT` | the staged NextBSD base with nextbsd-displayserver-support in `/usr` and nextbsd-xlibs in `/usr/X11` (scratch: components are installed into it) |
 | `CROSS_BINDIR` | the toolchain's clang, lld and LLVM tools (set by the image) |
 | `DESTDIR` | where to stage the artifact; default `/stage` |
 
@@ -151,7 +157,8 @@ For each component, in `COMPONENTS` order, one `build_<name>()`:
 `/usr/share/man`, or for an X client `/usr/X11/bin`, `/usr/X11/lib`,
 `/usr/X11/include` and `/usr/X11/share/man` (so no `/usr/local`, `/etc`, info
 or locale files); no staged file replaces a file already in the sysroot (the
-base, or nextbsd-xlibs' `/usr/X11`); `.pc` files are moved to the prefix's
+base, nextbsd-displayserver-support's `/usr` files, or nextbsd-xlibs'
+`/usr/X11`); `.pc` files are moved to the prefix's
 pkgconfig directory, must say `prefix=` that prefix (or, with no `prefix`
 variable, `libdir=<prefix>/lib`) and may not name `/usr/local` or a build
 path; libraries carry their upstream soname and link what they should, and

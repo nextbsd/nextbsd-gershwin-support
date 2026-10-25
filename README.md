@@ -113,7 +113,7 @@ builds, install roots and the generated cross file) is scratch and ignored.
 
 ## Build model
 
-`build-gershwin-support.sh` runs inside the `nextbsd-kernel-toolchain`
+`build-gershwin-support.sh` runs inside the `nextbsd-toolchain`
 container (clang/lld 19.1.7 and the LLVM binutils, meson, ninja, cmake,
 pkgconf, autotools) with compat's `continuous` base, then
 nextbsd-displayserver-support's (`/usr`) and nextbsd-xlibs' (`/usr/X11`)
